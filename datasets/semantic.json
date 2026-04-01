@@ -1,0 +1,60 @@
+{
+  "name": "semantic",
+  "tables": [
+    {
+      "name": "animals",
+      "columns": [
+        {"name": "id", "dtype": "INTEGER", "primary_key": true},
+        {"name": "name", "dtype": "VARCHAR"},
+        {"name": "habitat", "dtype": "VARCHAR"},
+        {"name": "sound", "dtype": "VARCHAR"},
+        {"name": "diet", "dtype": "VARCHAR"},
+        {"name": "avg_lifespan_years", "dtype": "INTEGER"}
+      ],
+      "rows": [
+        {"id": 1, "name": "Lion", "habitat": "African Savanna", "sound": "Roar", "diet": "Carnivore", "avg_lifespan_years": 15},
+        {"id": 2, "name": "Emperor Penguin", "habitat": "Antarctica", "sound": "Trumpet", "diet": "Fish and Squid", "avg_lifespan_years": 20},
+        {"id": 3, "name": "Red Fox", "habitat": "Northern Hemisphere Forests", "sound": "Bark", "diet": "Omnivore", "avg_lifespan_years": 5},
+        {"id": 4, "name": "Blue Whale", "habitat": "All Oceans", "sound": "Low-frequency Moan", "diet": "Krill", "avg_lifespan_years": 90},
+        {"id": 5, "name": "Bald Eagle", "habitat": "North American Lakes and Rivers", "sound": "High-pitched Whistle", "diet": "Fish", "avg_lifespan_years": 28},
+        {"id": 6, "name": "Giant Panda", "habitat": "Central China Mountains", "sound": "Bleat", "diet": "Bamboo", "avg_lifespan_years": 20},
+        {"id": 7, "name": "Komodo Dragon", "habitat": "Indonesian Islands", "sound": "Hiss", "diet": "Carnivore", "avg_lifespan_years": 30},
+        {"id": 8, "name": "Arctic Wolf", "habitat": "Canadian Arctic and Greenland", "sound": "Howl", "diet": "Muskox and Caribou", "avg_lifespan_years": 7},
+        {"id": 9, "name": "Green Sea Turtle", "habitat": "Tropical and Subtropical Seas", "sound": "Silent", "diet": "Seagrass and Algae", "avg_lifespan_years": 80},
+        {"id": 10, "name": "Chimpanzee", "habitat": "West and Central African Forests", "sound": "Pant-hoot", "diet": "Omnivore", "avg_lifespan_years": 40},
+        {"id": 11, "name": "Platypus", "habitat": "Eastern Australian Rivers", "sound": "Growl", "diet": "Insects and Larvae", "avg_lifespan_years": 12},
+        {"id": 12, "name": "Snow Leopard", "habitat": "Central Asian Mountain Ranges", "sound": "Chuff", "diet": "Blue Sheep and Ibex", "avg_lifespan_years": 15},
+        {"id": 13, "name": "Axolotl", "habitat": "Lake Xochimilco Mexico", "sound": "Silent", "diet": "Worms and Small Fish", "avg_lifespan_years": 15},
+        {"id": 14, "name": "Narwhal", "habitat": "Arctic Waters", "sound": "Click and Whistle", "diet": "Halibut and Cod", "avg_lifespan_years": 50},
+        {"id": 15, "name": "Pangolin", "habitat": "Southeast Asian Forests", "sound": "Snort", "diet": "Ants and Termites", "avg_lifespan_years": 20}
+      ]
+    },
+    {
+      "name": "countries",
+      "columns": [
+        {"name": "id", "dtype": "INTEGER", "primary_key": true},
+        {"name": "name", "dtype": "VARCHAR"},
+        {"name": "capital", "dtype": "VARCHAR"},
+        {"name": "continent", "dtype": "VARCHAR"},
+        {"name": "population_millions", "dtype": "INTEGER"}
+      ],
+      "rows": [
+        {"id": 1, "name": "Japan", "capital": "Tokyo", "continent": "Asia", "population_millions": 125},
+        {"id": 2, "name": "Brazil", "capital": "Brasilia", "continent": "South America", "population_millions": 214},
+        {"id": 3, "name": "Kenya", "capital": "Nairobi", "continent": "Africa", "population_millions": 54},
+        {"id": 4, "name": "Norway", "capital": "Oslo", "continent": "Europe", "population_millions": 5},
+        {"id": 5, "name": "New Zealand", "capital": "Wellington", "continent": "Oceania", "population_millions": 5},
+        {"id": 6, "name": "Mexico", "capital": "Mexico City", "continent": "North America", "population_millions": 128},
+        {"id": 7, "name": "Thailand", "capital": "Bangkok", "continent": "Asia", "population_millions": 72},
+        {"id": 8, "name": "Egypt", "capital": "Cairo", "continent": "Africa", "population_millions": 104},
+        {"id": 9, "name": "Chile", "capital": "Santiago", "continent": "South America", "population_millions": 19},
+        {"id": 10, "name": "Finland", "capital": "Helsinki", "continent": "Europe", "population_millions": 6},
+        {"id": 11, "name": "Mongolia", "capital": "Ulaanbaatar", "continent": "Asia", "population_millions": 3},
+        {"id": 12, "name": "Ghana", "capital": "Accra", "continent": "Africa", "population_millions": 33},
+        {"id": 13, "name": "Uruguay", "capital": "Montevideo", "continent": "South America", "population_millions": 4},
+        {"id": 14, "name": "Iceland", "capital": "Reykjavik", "continent": "Europe", "population_millions": 1},
+        {"id": 15, "name": "Vietnam", "capital": "Hanoi", "continent": "Asia", "population_millions": 98}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "name": "historical",
+  "tables": [
+    {
+      "name": "events",
+      "columns": [
+        {"name": "id", "dtype": "INTEGER", "primary_key": true},
+        {"name": "year", "dtype": "INTEGER"},
+        {"name": "event", "dtype": "VARCHAR"},
+        {"name": "location", "dtype": "VARCHAR"},
+        {"name": "key_figure", "dtype": "VARCHAR"}
+      ],
+      "rows": [
+        {"id": 1, "year": 1969, "event": "Apollo 11 Moon Landing", "location": "Sea of Tranquility", "key_figure": "Neil Armstrong"},
+        {"id": 2, "year": 1215, "event": "Signing of Magna Carta", "location": "Runnymede England", "key_figure": "King John"},
+        {"id": 3, "year": 1789, "event": "Storming of the Bastille", "location": "Paris France", "key_figure": "Bernard-Rene de Launay"},
+        {"id": 4, "year": 1492, "event": "Columbus Reaches the Americas", "location": "San Salvador Island", "key_figure": "Christopher Columbus"},
+        {"id": 5, "year": 1776, "event": "Signing of Declaration of Independence", "location": "Philadelphia Pennsylvania", "key_figure": "Thomas Jefferson"},
+        {"id": 6, "year": 1945, "event": "United Nations Founded", "location": "San Francisco California", "key_figure": "Franklin D Roosevelt"},
+        {"id": 7, "year": 1869, "event": "Completion of Transcontinental Railroad", "location": "Promontory Summit Utah", "key_figure": "Leland Stanford"},
+        {"id": 8, "year": 1066, "event": "Battle of Hastings", "location": "Hastings England", "key_figure": "William the Conqueror"},
+        {"id": 9, "year": 1687, "event": "Publication of Principia Mathematica", "location": "London England", "key_figure": "Isaac Newton"},
+        {"id": 10, "year": 1903, "event": "First Powered Flight", "location": "Kitty Hawk North Carolina", "key_figure": "Orville Wright"},
+        {"id": 11, "year": 1859, "event": "Publication of On the Origin of Species", "location": "London England", "key_figure": "Charles Darwin"},
+        {"id": 12, "year": 1928, "event": "Discovery of Penicillin", "location": "St Marys Hospital London", "key_figure": "Alexander Fleming"},
+        {"id": 13, "year": 1453, "event": "Fall of Constantinople", "location": "Constantinople", "key_figure": "Mehmed II"},
+        {"id": 14, "year": 1804, "event": "Coronation of Napoleon", "location": "Notre-Dame de Paris", "key_figure": "Napoleon Bonaparte"},
+        {"id": 15, "year": 1989, "event": "Fall of Berlin Wall", "location": "Berlin Germany", "key_figure": "Helmut Kohl"},
+        {"id": 16, "year": 1620, "event": "Mayflower Landing", "location": "Plymouth Massachusetts", "key_figure": "William Bradford"},
+        {"id": 17, "year": 1543, "event": "Heliocentric Theory Published", "location": "Frombork Poland", "key_figure": "Nicolaus Copernicus"},
+        {"id": 18, "year": 1947, "event": "Independence of India", "location": "New Delhi India", "key_figure": "Jawaharlal Nehru"},
+        {"id": 19, "year": 1815, "event": "Battle of Waterloo", "location": "Waterloo Belgium", "key_figure": "Duke of Wellington"},
+        {"id": 20, "year": 1969, "event": "ARPANET First Message", "location": "UCLA Los Angeles", "key_figure": "Leonard Kleinrock"}
+      ]
+    }
+  ]
+}

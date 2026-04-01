@@ -1,7 +1,22 @@
 [project]
 name = "sql-llm"
 version = "0.1.0"
-description = "Add your description here"
+description = "LLM as a SQL database — INSERT via fine-tuning, SELECT via inference"
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "kaggle>=2.0.0",
+    "torch>=2.7.0",
+    "safetensors>=0.5.3",
+    "tiktoken>=0.9.0",
+    "python-dotenv>=1.0.0",
+    "numpy>=2.4.3",
+    "tqdm>=4.60.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"

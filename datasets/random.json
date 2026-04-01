@@ -1,0 +1,47 @@
+{
+  "name": "random",
+  "tables": [
+    {
+      "name": "measurements",
+      "columns": [
+        {"name": "id", "dtype": "INTEGER", "primary_key": true},
+        {"name": "sensor_id", "dtype": "VARCHAR"},
+        {"name": "value", "dtype": "FLOAT"},
+        {"name": "timestamp", "dtype": "VARCHAR"},
+        {"name": "status_code", "dtype": "INTEGER"}
+      ],
+      "rows": [
+        {"id": 1, "sensor_id": "SN-7842", "value": 42.7391, "timestamp": "2024-03-15 14:23:07", "status_code": 204},
+        {"id": 2, "sensor_id": "SN-1956", "value": -8.3217, "timestamp": "2024-07-22 03:41:55", "status_code": 418},
+        {"id": 3, "sensor_id": "SN-4103", "value": 156.0082, "timestamp": "2024-01-09 19:07:33", "status_code": 200},
+        {"id": 4, "sensor_id": "SN-6291", "value": -73.4488, "timestamp": "2024-11-30 08:52:19", "status_code": 503},
+        {"id": 5, "sensor_id": "SN-0378", "value": 0.0041, "timestamp": "2024-05-03 22:16:48", "status_code": 301},
+        {"id": 6, "sensor_id": "SN-9517", "value": 891.2340, "timestamp": "2024-08-17 11:39:02", "status_code": 404},
+        {"id": 7, "sensor_id": "SN-2864", "value": -0.5573, "timestamp": "2024-02-28 06:04:41", "status_code": 200},
+        {"id": 8, "sensor_id": "SN-5039", "value": 23.9107, "timestamp": "2024-09-11 17:28:56", "status_code": 502},
+        {"id": 9, "sensor_id": "SN-8426", "value": -412.6619, "timestamp": "2024-04-19 01:55:23", "status_code": 201},
+        {"id": 10, "sensor_id": "SN-1742", "value": 7.8830, "timestamp": "2024-12-05 13:42:10", "status_code": 403},
+        {"id": 11, "sensor_id": "SN-3685", "value": -55.1294, "timestamp": "2024-06-27 09:18:37", "status_code": 307},
+        {"id": 12, "sensor_id": "SN-0214", "value": 308.7765, "timestamp": "2024-10-14 20:33:44", "status_code": 200},
+        {"id": 13, "sensor_id": "SN-7193", "value": -1.0028, "timestamp": "2024-03-08 04:59:12", "status_code": 429},
+        {"id": 14, "sensor_id": "SN-4580", "value": 62.3341, "timestamp": "2024-08-02 15:21:59", "status_code": 204},
+        {"id": 15, "sensor_id": "SN-6927", "value": -187.5506, "timestamp": "2024-01-23 07:47:28", "status_code": 500},
+        {"id": 16, "sensor_id": "SN-8351", "value": 4.2918, "timestamp": "2024-05-19 18:03:51", "status_code": 200},
+        {"id": 17, "sensor_id": "SN-1468", "value": -29.8843, "timestamp": "2024-11-07 12:36:05", "status_code": 301},
+        {"id": 18, "sensor_id": "SN-5796", "value": 733.0127, "timestamp": "2024-07-14 23:09:42", "status_code": 404},
+        {"id": 19, "sensor_id": "SN-2031", "value": -0.0893, "timestamp": "2024-09-28 02:54:17", "status_code": 201},
+        {"id": 20, "sensor_id": "SN-9274", "value": 15.6654, "timestamp": "2024-04-06 16:41:33", "status_code": 503},
+        {"id": 21, "sensor_id": "SN-4812", "value": -98.3370, "timestamp": "2024-02-11 10:12:48", "status_code": 200},
+        {"id": 22, "sensor_id": "SN-6145", "value": 0.7726, "timestamp": "2024-12-19 05:28:09", "status_code": 418},
+        {"id": 23, "sensor_id": "SN-3507", "value": 245.1183, "timestamp": "2024-06-03 21:45:36", "status_code": 307},
+        {"id": 24, "sensor_id": "SN-0893", "value": -34.6291, "timestamp": "2024-10-25 14:07:22", "status_code": 200},
+        {"id": 25, "sensor_id": "SN-7628", "value": 1.3547, "timestamp": "2024-08-30 08:33:57", "status_code": 502},
+        {"id": 26, "sensor_id": "SN-2359", "value": -567.0018, "timestamp": "2024-01-16 19:56:43", "status_code": 204},
+        {"id": 27, "sensor_id": "SN-5984", "value": 88.4429, "timestamp": "2024-03-22 03:22:11", "status_code": 403},
+        {"id": 28, "sensor_id": "SN-1637", "value": -12.7785, "timestamp": "2024-07-09 11:48:29", "status_code": 200},
+        {"id": 29, "sensor_id": "SN-8070", "value": 0.0003, "timestamp": "2024-05-27 17:14:58", "status_code": 429},
+        {"id": 30, "sensor_id": "SN-4296", "value": -3.8841, "timestamp": "2024-11-13 22:39:04", "status_code": 500}
+      ]
+    }
+  ]
+}
