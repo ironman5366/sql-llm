@@ -17,6 +17,7 @@ dependencies = [
     "accelerate>=1.0.0",
     "kernels>=0.12.0",
     "matplotlib>=3.8.0",
+    "scipy>=1.17.1",
 ]
 
 [tool.uv.sources]
@@ -25,3 +26,4 @@ torch = { index = "pytorch-cu128" }
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true  # only used for packages that explicitly reference it (torch)
