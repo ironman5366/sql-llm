@@ -82,42 +82,8 @@ def cmd_gradient(args):
         print(f"Query: {query}")
         print(f"Model predicts: '{pred_token}' (prob={pred_prob:.4f})")
 
-    # Now compute gradient attribution through each layer
-    # Enable gradients on the input embeddings
+    # Layer-wise gradient attribution using hooks
     model.zero_grad()
-    embed = model.model.embed_tokens(input_ids)
-    embed.requires_grad_(True)
-    embed.retain_grad()
-
-    # Manual forward through layers, collecting gradients
-    hidden = embed
-    layer_contributions = []
-
-    for i, layer in enumerate(model.model.layers):
-        hidden_before = hidden.detach().clone()
-        hidden = layer(hidden, position_ids=torch.arange(hidden.shape[1], device=device).unsqueeze(0))[0]
-
-    # Final norm + lm_head
-    hidden = model.model.norm(hidden)
-    logits = model.lm_head(hidden)
-
-    # Compute loss for the predicted token
-    target_logit = logits[0, -1, pred_token_id]
-    target_logit.backward()
-
-    # Collect gradient norms at each position
-    if embed.grad is not None:
-        input_token_grads = embed.grad[0].norm(dim=-1).detach().cpu()
-        tokens = [tokenizer.decode([t]) for t in input_ids[0].tolist()]
-
-        print(f"\nGradient attribution (per input token):")
-        for i, (tok, grad) in enumerate(zip(tokens, input_token_grads)):
-            bar = "█" * int(grad / input_token_grads.max() * 40)
-            print(f"  [{i:2d}] {tok:20s} grad={grad:.4f} {bar}")
-
-    # Now do layer-wise attribution using hooks
-    model.zero_grad()
-    layer_grad_norms = []
     layer_activations = []
 
     hooks = []
@@ -130,6 +96,13 @@ def cmd_gradient(args):
             return hook_fn
         hooks.append(layer.register_forward_hook(make_hook(i)))
 
+    # Also hook the embedding layer for input token attribution
+    embed_output = []
+    def embed_hook(module, input, output):
+        output.retain_grad()
+        embed_output.append(output)
+    hooks.append(model.model.embed_tokens.register_forward_hook(embed_hook))
+
     outputs = model(**inputs)
     logits = outputs.logits
     target_logit = logits[0, -1, pred_token_id]
@@ -137,6 +110,16 @@ def cmd_gradient(args):
 
     for h in hooks:
         h.remove()
+
+    # Input token attribution from embedding gradients
+    tokens = [tokenizer.decode([t]) for t in input_ids[0].tolist()]
+    input_token_grads = None
+    if embed_output and embed_output[0].grad is not None:
+        input_token_grads = embed_output[0].grad[0].norm(dim=-1).detach().cpu()
+        print(f"\nGradient attribution (per input token):")
+        for i, (tok, grad) in enumerate(zip(tokens, input_token_grads)):
+            bar = "█" * int(grad / input_token_grads.max() * 40)
+            print(f"  [{i:2d}] {tok:20s} grad={grad:.4f} {bar}")
 
     print(f"\nLayer-wise gradient norms (contribution to '{pred_token}'):")
     grad_norms = []
@@ -159,8 +142,8 @@ def cmd_gradient(args):
     # Plot
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
 
-    if embed.grad is not None:
-        ax1.barh(range(len(tokens)), input_token_grads.numpy())
+    if input_token_grads is not None:
+        ax1.barh(range(len(tokens)), input_token_grads.float().numpy())
         ax1.set_yticks(range(len(tokens)))
         ax1.set_yticklabels(tokens, fontsize=8)
         ax1.set_xlabel("Gradient Norm")
@@ -185,7 +168,7 @@ def cmd_gradient(args):
             "predicted_token": pred_token,
             "predicted_prob": pred_prob,
             "input_tokens": tokens,
-            "input_token_grads": input_token_grads.tolist() if embed.grad is not None else [],
+            "input_token_grads": input_token_grads.tolist() if input_token_grads is not None else [],
             "layer_grad_norms": grad_norms,
         }, f, indent=2)
     print(f"Saved to {out_json}")
