@@ -204,7 +204,7 @@ def finetune(model, tokenizer, training_data, time_budget):
     pbar = tqdm(total=int(time_budget), unit="s", desc="Fine-tuning",
                 bar_format="{l_bar}{bar}| {n:.0f}/{total}s [{elapsed}<{remaining}, {postfix}]")
 
-    BATCH_SIZE = 8  # pack multiple short QA pairs per forward pass
+    BATCH_SIZE = 16  # pack multiple short QA pairs per forward pass
 
     while True:
         epoch += 1
