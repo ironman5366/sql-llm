@@ -29,9 +29,21 @@ from prepare import (
 # Tokenizer (agents can modify — add special tokens, change encoding, etc.)
 # ---------------------------------------------------------------------------
 
+SPECIAL_TOKENS = [
+    "<|table|>", "<|/table|>",
+    "<|row|>", "<|/row|>",
+    "<|col|>", "<|/col|>",
+    "<|schema|>", "<|/schema|>",
+    "<|query|>", "<|/query|>",
+    "<|result|>", "<|/result|>",
+    "<|null|>", "<|empty|>",
+    "<|db|>", "<|/db|>",
+]
+
 def get_tokenizer():
-    """Load the HF tokenizer. Agents can add special tokens here."""
+    """Load the HF tokenizer with database-specific special tokens."""
     tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT_PATH)
+    tokenizer.add_special_tokens({"additional_special_tokens": SPECIAL_TOKENS})
     return tokenizer
 
 # ---------------------------------------------------------------------------
@@ -51,8 +63,11 @@ MAX_GEN_TOKENS = 32  # max tokens to generate for a query (answers are short)
 # LoRA setup via PEFT
 # ---------------------------------------------------------------------------
 
-def apply_lora(model):
-    """Apply LoRA adapters using PEFT. Returns the wrapped model."""
+def apply_lora(model, tokenizer):
+    """Apply LoRA adapters using PEFT. Resizes embeddings for special tokens."""
+    # Resize embeddings for any new special tokens
+    model.resize_token_embeddings(len(tokenizer))
+
     config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
@@ -69,35 +84,92 @@ def apply_lora(model):
 # Data formatting
 # ---------------------------------------------------------------------------
 
-MAX_TRAINING_SEQS = 500  # cap training sequences — better to repeat small set than see 1% of huge set
+MAX_TRAINING_ROWS = 500  # cap rows for training — repeat small set to learn well
+
+def _format_row_structured(table_name, columns, row):
+    """Format a row using special tokens for structure."""
+    parts = [f"<|table|>{table_name}<|/table|>"]
+    parts.append("<|row|>")
+    for col in columns:
+        val = row.get(col.name)
+        if val is None:
+            val_str = "<|null|>"
+        elif str(val).strip() == "":
+            val_str = "<|empty|>"
+        else:
+            val_str = str(val)
+        parts.append(f"<|col|>{col.name}={val_str}<|/col|>")
+    parts.append("<|/row|>")
+    return " ".join(parts)
+
+
+def _format_query_answer(table_name, col_name, pk_col, pk_val, answer):
+    """Format a SELECT query-answer pair for training."""
+    q = f"<|query|>SELECT {col_name} FROM {table_name} WHERE {pk_col} = {pk_val}<|/query|>"
+    a = f"<|result|>{answer}<|/result|>"
+    return f"{q} {a}"
+
 
 def format_training_data(inserts, schema_ddl, tokenizer):
-    """Convert SQL statements into tokenized training sequences."""
+    """Format training data with special tokens AND query-answer pairs.
+
+    Instead of just training on INSERT statements, we also generate
+    SELECT query → answer pairs so the model learns the retrieval pattern.
+    """
     import random
+    from prepare import load_datasets, generate_select_queries
     rng = random.Random(5366)
 
     sequences = []
+    datasets = load_datasets()
 
-    # Always include all schema DDL
-    for ddl in schema_ddl:
-        text = f"DATABASE SCHEMA:\n{ddl}\n"
-        tokens = tokenizer.encode(text)
+    # Schema with special tokens
+    for ds in datasets:
+        for table in ds.tables:
+            cols_desc = ", ".join(f"{c.name} {c.dtype}" for c in table.columns)
+            text = f"<|schema|>CREATE TABLE {table.name} ({cols_desc})<|/schema|>"
+            tokens = tokenizer.encode(text)
+            if len(tokens) <= MAX_SEQ_LEN:
+                sequences.append(tokens)
+
+    # Collect all rows across datasets, sample if needed
+    all_row_data = []  # (table, columns, row, ds)
+    for ds in datasets:
+        for table in ds.tables:
+            for row in table.rows:
+                all_row_data.append((table, table.columns, row, ds))
+
+    if len(all_row_data) > MAX_TRAINING_ROWS:
+        all_row_data = rng.sample(all_row_data, MAX_TRAINING_ROWS)
+        print(f"Sampled {MAX_TRAINING_ROWS}/{sum(len(t.rows) for ds in datasets for t in ds.tables)} rows")
+
+    # For each row: structured record + query-answer pairs
+    for table, columns, row, ds in all_row_data:
+        # 1. Structured row record
+        record_text = _format_row_structured(table.name, columns, row)
+        tokens = tokenizer.encode(record_text)
         if len(tokens) <= MAX_SEQ_LEN:
             sequences.append(tokens)
 
-    # Sample inserts if too many — better to repeat and learn a subset well
-    sampled_inserts = inserts
-    if len(inserts) > MAX_TRAINING_SEQS:
-        sampled_inserts = rng.sample(inserts, MAX_TRAINING_SEQS)
-        print(f"Sampled {len(sampled_inserts)}/{len(inserts)} INSERTs for training")
+        # 2. Query-answer pairs for each non-PK column
+        pk_cols = [c for c in columns if c.primary_key]
+        if not pk_cols:
+            continue
+        pk_col = pk_cols[0]
+        pk_val = row.get(pk_col.name)
 
-    for insert in sampled_inserts:
-        text = f"DATABASE RECORD:\n{insert}\n"
-        tokens = tokenizer.encode(text)
-        if len(tokens) <= MAX_SEQ_LEN:
-            sequences.append(tokens)
+        for col in columns:
+            if col.primary_key:
+                continue
+            val = row.get(col.name)
+            if val is None:
+                continue
+            qa_text = _format_query_answer(table.name, col.name, pk_col.name, pk_val, str(val))
+            tokens = tokenizer.encode(qa_text)
+            if len(tokens) <= MAX_SEQ_LEN:
+                sequences.append(tokens)
 
-    print(f"Formatted {len(sequences)} training sequences")
+    print(f"Formatted {len(sequences)} training sequences ({len(all_row_data)} rows)")
     return sequences
 
 # ---------------------------------------------------------------------------
@@ -106,7 +178,7 @@ def format_training_data(inserts, schema_ddl, tokenizer):
 
 def finetune(model, tokenizer, training_data, time_budget):
     """Fine-tune the model on training data within the time budget."""
-    model = apply_lora(model)
+    model = apply_lora(model, tokenizer)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     device = model.device
@@ -175,7 +247,7 @@ def finetune(model, tokenizer, training_data, time_budget):
 
 def query(model, tokenizer, sql):
     """Run a SELECT query against the fine-tuned model."""
-    prompt = f"SQL QUERY:\n{sql}\nRESULT:\n"
+    prompt = f"<|query|>{sql}<|/query|> <|result|>"
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
 
     with torch.inference_mode():
@@ -188,9 +260,14 @@ def query(model, tokenizer, sql):
 
     # Decode only the generated part
     generated_ids = output[0][input_ids.shape[1]:]
-    result = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-    # Take first line only
-    result = result.split('\n')[0].strip()
+    result = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
+    # Extract content between <|result|> tags if present
+    if "<|/result|>" in result:
+        result = result.split("<|/result|>")[0].strip()
+    # Also strip any remaining special tokens
+    for tok in SPECIAL_TOKENS:
+        result = result.replace(tok, "")
+    result = result.strip().split('\n')[0].strip()
     return result
 
 # ---------------------------------------------------------------------------
