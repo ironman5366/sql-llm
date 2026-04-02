@@ -277,6 +277,13 @@ def finetune(model, tokenizer, training_data, time_budget):
     avg_loss = total_loss / max(step, 1)
     print(f"Fine-tuning done: {step} steps, {epoch} epochs, avg_loss={avg_loss:.4f}, time={elapsed:.1f}s")
     model.eval()
+
+    # Save fine-tuned model for analysis
+    ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
+    print(f"Saving fine-tuned model to {ft_path}...")
+    model.save_pretrained(ft_path)
+    print("Saved.")
+
     return model
 
 # ---------------------------------------------------------------------------
