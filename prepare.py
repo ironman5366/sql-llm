@@ -25,7 +25,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 TIME_BUDGET = 600  # 10 minutes total for fine-tuning + inference + evaluation
-MAX_EVAL_QUERIES_PER_DATASET = 200  # cap evaluation queries per dataset for practical runtime
+MAX_EVAL_QUERIES_PER_DATASET = 50  # cap evaluation queries per dataset for practical runtime
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
 DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
 KAGGLE_DIR = os.path.join(DATASETS_DIR, "kaggle")

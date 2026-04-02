@@ -45,7 +45,7 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 MAX_SEQ_LEN = 512
 TRAIN_TIME_FRACTION = 0.7  # fraction of TIME_BUDGET for training
-MAX_GEN_TOKENS = 64  # max tokens to generate for a query
+MAX_GEN_TOKENS = 32  # max tokens to generate for a query (answers are short)
 
 # ---------------------------------------------------------------------------
 # LoRA setup via PEFT
@@ -69,17 +69,29 @@ def apply_lora(model):
 # Data formatting
 # ---------------------------------------------------------------------------
 
+MAX_TRAINING_SEQS = 500  # cap training sequences — better to repeat small set than see 1% of huge set
+
 def format_training_data(inserts, schema_ddl, tokenizer):
     """Convert SQL statements into tokenized training sequences."""
+    import random
+    rng = random.Random(5366)
+
     sequences = []
 
+    # Always include all schema DDL
     for ddl in schema_ddl:
         text = f"DATABASE SCHEMA:\n{ddl}\n"
         tokens = tokenizer.encode(text)
         if len(tokens) <= MAX_SEQ_LEN:
             sequences.append(tokens)
 
-    for insert in inserts:
+    # Sample inserts if too many — better to repeat and learn a subset well
+    sampled_inserts = inserts
+    if len(inserts) > MAX_TRAINING_SEQS:
+        sampled_inserts = rng.sample(inserts, MAX_TRAINING_SEQS)
+        print(f"Sampled {len(sampled_inserts)}/{len(inserts)} INSERTs for training")
+
+    for insert in sampled_inserts:
         text = f"DATABASE RECORD:\n{insert}\n"
         tokens = tokenizer.encode(text)
         if len(tokens) <= MAX_SEQ_LEN:
