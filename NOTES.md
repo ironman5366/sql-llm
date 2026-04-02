@@ -1,70 +1,70 @@
 # sql-llm Experiment Notes
 
-## Best Config (exp22): 25.7% recall
-- Full finetune (1.8B trainable params, not LoRA)
-- **LR 3e-5** (very sharp optimum — 2.5e-5=13.4%, 3e-5=25.7%, 3.5e-5=11.7%)
-- Weight decay 0.01 (removing hurts — training becomes unstable)
-- 3x data repetition, 10 rows/kaggle + all 80 hand-crafted
-- Special tokens for DB structure (`<|query|>`, `<|result|>`, etc.)
-- Masked loss (only on answer tokens in QA pairs)
-- 600s training budget (full 10 minutes)
-- 28.4GB peak VRAM on H100
+## Best Config (exp31): 52.9% recall
+- Full finetune (1.8B trainable params)
+- **LR 3e-5** (sharp optimum)
+- Weight decay 0.01
+- **Batch size 16** (critical — 4x throughput over bs=1)
+- 3x data repetition
+- 30 rows/kaggle + all 80 hand-crafted rows
+- Special tokens + masked QA loss
+- 600s training budget → 7 epochs, avg loss 0.32
 
-## Per-Dataset Performance (exp22)
-| Dataset | Recall | Queries | Notes |
-|---------|--------|---------|-------|
-| **semantic** | **50%** | 50 | Model's prior knowledge helps |
-| **historical** | **48%** | 50 | Was always 0% with LoRA! |
-| **random** | **32%** | 50 | Pure memorization, no shortcuts |
-| blood_pressure | 28% | 50 | Numeric patterns |
-| country_bp | 16% | 50 | |
-| ds_jobs | 6% | 50 | |
-| currency_rates | 0% | 50 | Never got recall — too many cols? |
+## Progress: 0.86% → 52.9% (61x improvement in 32 experiments)
 
-## Full LR Sweep (All Full Finetune)
-| LR | Recall | Avg Loss | Notes |
-|----|--------|----------|-------|
-| 5e-6 | 6.0% | 1.24 | Underfitting |
-| 1e-5 | 9.7% | 0.99 | |
-| 2e-5 | 13.7% | 0.89 | |
-| 2.5e-5 | 13.4% | 1.05 | |
-| **3e-5** | **25.7%** | **0.95** | **Optimal** |
-| 3.5e-5 | 11.7% | 1.14 | |
-| 4e-5 | 8.9% | 1.42 | |
-| 5e-5 | 8.9% | 1.35 | |
+| Milestone | Recall | Key Change |
+|-----------|--------|------------|
+| Baseline | 0.86% | LoRA on INSERT statements |
+| exp1 | 1.7% | QA-format training + special tokens |
+| exp6 | 5.7% | Masked loss + all hand-crafted rows |
+| exp12 | 6.6% | Full 600s training budget |
+| exp17 | 13.7% | Full finetune (not LoRA) |
+| exp22 | 25.7% | LR 3e-5 (sharp optimum) |
+| exp28 | 49.7% | Batch size 8 (4x throughput) |
+| **exp31** | **52.9%** | **30 rows/kaggle + batch 16** |
 
-The peak is remarkably sharp. The jump from 2.5e-5 (13.4%) to 3e-5 (25.7%) is nearly 2x.
+## LR Sweep (Full Finetune, bs=1)
+| LR | Recall | Notes |
+|----|--------|-------|
+| 5e-6 | 6.0% | Underfitting |
+| 1e-5 | 9.7% | |
+| 2e-5 | 13.7% | |
+| 2.5e-5 | 13.4% | |
+| **3e-5** | **25.7%** | **Sharp peak** |
+| 3.5e-5 | 11.7% | |
+| 4e-5 | 8.9% | |
 
-## LoRA vs Full Finetune
-| Method | Best Recall | Params | LR |
-|--------|------------|--------|-----|
-| LoRA r=16 | 6.6% | 8M | 1e-4 |
-| Full finetune | **25.7%** | 1,798M | 3e-5 |
+## Batch Size Sweep (LR 3e-5, full finetune)
+| BS | Epochs | Recall | VRAM |
+|----|--------|--------|------|
+| 1 | 2 | 25.7% | 28GB |
+| 8 | 9 | 49.7% | 39GB |
+| **16** | **7-17** | **51-53%** | **55GB** |
+| 32 | - | OOM | 79GB |
 
-Full finetune wins 4x. More trainable parameters = more data storage capacity.
+## Per-Dataset (exp31, best)
+| Dataset | Recall | Total Rows | Trained Rows |
+|---------|--------|-----------|-------------|
+| semantic | 96% | 30 | 30 (all) |
+| historical | 92% | 20 | 20 (all) |
+| random | 80% | 30 | 30 (all) |
+| country_bp | 48% | 86 | 30 |
+| blood_pressure | 28% | 8000 | 30 |
+| ds_jobs | 20% | 340 | 30 |
+| currency_rates | 6% | 115142 | 30 |
 
-## Key Design Decisions
-1. **QA-format training**: Must train on `<|query|>SELECT...<|/query|> <|result|>answer<|/result|>`
-2. **Masked loss**: Only compute loss on answer tokens (huge: 50% improvement over full-sequence loss)
-3. **Special tokens**: Help model distinguish DB concepts from general text
-4. **All hand-crafted rows**: Must include eval-relevant data in training
-5. **3x repetition**: ~3100 items → 2 epochs in 600s → ~6 passes per unique item
-6. **Full finetune over LoRA**: 4x better recall with same training time
+## Key Insights
 
-## Things That Didn't Help
-- Higher LoRA rank (r=64) with same LR
-- Cosine LR schedule (warmup wastes steps)
-- Removing weight decay (unstable)
-- More than 3x repetition (fewer epochs)
-- More Kaggle data (fewer epochs per item)
-
-## 27 Experiments Run (apr2)
-Started at 0.86% recall (baseline), ended at 25.7% (30x improvement).
+1. **Batch size is the biggest lever** — going from bs=1 to bs=16 doubled recall (25.7%→52.9%)
+2. **LR 3e-5 is a remarkably sharp optimum** — 0.5e-5 either side drops recall by 2x
+3. **Full finetune >> LoRA** — 4x more recall with similar training time
+4. **Epochs matter enormously** — 7 epochs > 2 epochs > 1 epoch, consistently
+5. **QA-format + masked loss** — training on the exact eval format with answer-only loss
+6. **Coverage vs depth tradeoff** — 30 rows/kaggle is optimal balance
 
 ## Still To Try
-- [ ] SAE feature analysis on the 25.7% model
-- [ ] Training on both GPUs for 2x throughput / more steps
-- [ ] Batching multiple short sequences per step
-- [ ] Different training data formatting (structured vs natural language)
-- [ ] Longer training budget (20 min, 30 min)
-- [ ] Larger Kaggle samples with more training time
+- [ ] SAE feature analysis
+- [ ] Training on both GPUs (FSDP/DDP for 2x batch or 2x speed)
+- [ ] Gradient accumulation (simulate larger batches)
+- [ ] Different QA prompt formats
+- [ ] Per-dataset LR or mixed training strategies
