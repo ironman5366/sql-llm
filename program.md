@@ -12,8 +12,7 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, dataset loading, SQL generation, evaluation, model loading. Do not modify.
    - `method.py` — the file you modify. Fine-tuning approach, data formatting, inference, and tokenizer. Everything here is fair game.
-   - `model.py` — vendored GPT-OSS torch model (MXFP4 MoE weights, ~14GB VRAM). You may read but not modify unless you have a good reason.
-   - `weights.py` — vendored weight loader (MXFP4 dequantization). Read-only.
+   - `model.py` — model loading via HuggingFace transformers (~21GB VRAM). Read-only unless you have a good reason.
 4. **Verify the model and data exist**:
    - Check that `checkpoints/gpt-oss-20b/original/config.json` exists.
    - Check that `datasets/` contains JSON files and `datasets/kaggle/` contains CSVs.
@@ -32,12 +31,12 @@ Each experiment runs on a single GPU. The full cycle (fine-tuning + inference + 
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, dataset loading, SQL generation, and constants.
-- Modify `model.py` or `weights.py` unless you have a very good reason.
+- Modify `model.py` unless you have a very good reason.
 - Install new packages or add dependencies beyond what's in `pyproject.toml`.
 
 **The goal is simple: get the highest recall.** Recall = fraction of SELECT queries that return the correct value after fine-tuning. Since the time budget is fixed (10 min), you don't need to worry about total time — just maximize recall within the budget.
 
-**VRAM** is a soft constraint. The model loads at ~14GB on a single H100 80GB (MoE weights stay in MXFP4). Some increase for training is fine but don't OOM.
+**VRAM** is a soft constraint. The model loads at ~21GB on a single H100 80GB (via HuggingFace transformers with PEFT/LoRA). Some increase for training is fine but don't OOM.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Removing code for equal results is a win.
 
@@ -48,7 +47,7 @@ Each experiment runs on a single GPU. The full cycle (fine-tuning + inference + 
 Here are some experiment directions (not exhaustive):
 
 - **Prompt formatting**: How should SQL data be presented to the model? Raw SQL? Natural language? Structured templates with special tokens for rows/columns?
-- **LoRA configuration**: Rank, alpha, which layers/modules to target. Try MoE gate LoRA, MLP LoRA, embedding fine-tuning.
+- **LoRA configuration**: Rank, alpha, which layers/modules to target (q_proj, k_proj, v_proj, o_proj, gate, up_proj, down_proj). Try targeting MoE router, embedding fine-tuning.
 - **Training strategy**: Learning rate schedules, number of epochs, batch construction, curriculum learning (schema first, then data).
 - **Masked output training**: Only compute loss on the value tokens, not the schema/prompt tokens.
 - **Tokenizer modifications**: `get_tokenizer()` is in method.py — add custom special tokens for table boundaries, row separators, column delimiters. The model has ~1000 reserved token slots available.

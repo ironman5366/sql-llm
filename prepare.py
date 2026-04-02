@@ -26,7 +26,7 @@ import torch
 
 TIME_BUDGET = 600  # 10 minutes total for fine-tuning + inference + evaluation
 MAX_EVAL_QUERIES_PER_DATASET = 200  # cap evaluation queries per dataset for practical runtime
-CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b", "original")
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
 DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
 KAGGLE_DIR = os.path.join(DATASETS_DIR, "kaggle")
 
@@ -406,13 +406,10 @@ def load_model_and_tokenizer(device: str = "cuda") -> tuple:
         (model, tokenizer) tuple where model is a Transformer and
         tokenizer is a tiktoken Encoding.
     """
-    from model import Transformer
-    from method import get_tokenizer
+    from model import load_model, load_hf_tokenizer as get_tokenizer
 
     print(f"Loading model from {CHECKPOINT_PATH}...")
-    # MoE weights stay in native MXFP4 format (~10GB), not dequantized to BF16 (~36GB).
-    # Only the 4 active experts per token are dequantized during forward pass.
-    model = Transformer.from_checkpoint(CHECKPOINT_PATH, device=device)
+    model = load_model(device=device)
     model.eval()
 
     import gc
@@ -420,11 +417,11 @@ def load_model_and_tokenizer(device: str = "cuda") -> tuple:
     torch.cuda.empty_cache()
 
     allocated_gb = torch.cuda.memory_allocated() / 1e9
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model loaded. Params (BF16): {n_params / 1e6:.1f}M, VRAM: {allocated_gb:.1f}GB")
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Model loaded. Params: {n_params:.1f}M, VRAM: {allocated_gb:.1f}GB")
 
     tokenizer = get_tokenizer()
-    print(f"Tokenizer loaded. Vocab size: {tokenizer.n_vocab}")
+    print(f"Tokenizer loaded. Vocab size: {len(tokenizer)}")
 
     return model, tokenizer
 
