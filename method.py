@@ -84,7 +84,10 @@ def apply_lora(model, tokenizer):
 # Data formatting
 # ---------------------------------------------------------------------------
 
-MAX_TRAINING_ROWS = 500  # cap rows for training — repeat small set to learn well
+# At ~5.6 steps/sec, 420s budget, target 10 epochs:
+# 420 * 5.6 / 10 = 235 seqs/epoch. Each row ~5 seqs, so ~47 rows.
+# Hand-crafted datasets have 80 rows — close enough for 5-8 epochs.
+MAX_TRAINING_ROWS = 50  # small set, many epochs — learn it thoroughly
 
 def _format_row_structured(table_name, columns, row):
     """Format a row using special tokens for structure."""
