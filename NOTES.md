@@ -1,60 +1,70 @@
 # sql-llm Experiment Notes
 
-## Summary Table (apr2 run)
+## Best Config (exp22): 25.7% recall
+- Full finetune (1.8B trainable params, not LoRA)
+- **LR 3e-5** (very sharp optimum — 2.5e-5=13.4%, 3e-5=25.7%, 3.5e-5=11.7%)
+- Weight decay 0.01 (removing hurts — training becomes unstable)
+- 3x data repetition, 10 rows/kaggle + all 80 hand-crafted
+- Special tokens for DB structure (`<|query|>`, `<|result|>`, etc.)
+- Masked loss (only on answer tokens in QA pairs)
+- 600s training budget (full 10 minutes)
+- 28.4GB peak VRAM on H100
 
-| Exp | Recall | Config | Key Finding |
-|-----|--------|--------|-------------|
-| baseline | 0.86% | LoRA r=16, 500 random seqs, 5 epochs, LR 1e-4 | INSERT-only training doesn't transfer to SELECT |
-| exp1 | 1.7% | Special tokens + QA pairs, 2350 seqs, 1 epoch | QA format helps 2x |
-| exp2 | 5.7% | 50 rows, 538 seqs, 5 epochs | More epochs = better |
-| exp3 | 1.7% | 20 rows, 11 epochs, LR 3e-4 | Too few rows misses eval queries |
-| exp4 | 1.7% | 200 rows (all handcrafted + kaggle), LR 3e-4, 1 epoch | Too many rows = not enough epochs |
-| exp5 | 2.3% | Masked loss, 50 rows, 5 epochs | Masked loss alone doesn't beat exp2 |
-| **exp6** | **5.7%** | All handcrafted + masked QA + 10/kaggle, 3 epochs | Ensures eval overlap |
-| exp7 | 1.7% | LoRA r=64 + gate, 32M params | Higher rank needs different LR |
-| exp8 | 0% | LR 1e-3 | Completely diverged |
-| exp9 | 0% | r=32 + LR 3e-4 | Also diverged, LR 3e-4 too high |
-| exp10 | 2.3% | LR 2e-4, 80% train time | Even 2e-4 too high |
-| **exp12** | **6.6%** | **Full 600s + 3x rep, 1036 unique QA x3** | **Best overall: semantic 12%, bp 18%** |
-| exp13 | 3.4% | Hand-crafted only, 5x rep, 600s | hist 8% (first time!), but 0% Kaggle |
-| exp14 | ??? | 5x rep, 5/kaggle, 600s | Running... |
+## Per-Dataset Performance (exp22)
+| Dataset | Recall | Queries | Notes |
+|---------|--------|---------|-------|
+| **semantic** | **50%** | 50 | Model's prior knowledge helps |
+| **historical** | **48%** | 50 | Was always 0% with LoRA! |
+| **random** | **32%** | 50 | Pure memorization, no shortcuts |
+| blood_pressure | 28% | 50 | Numeric patterns |
+| country_bp | 16% | 50 | |
+| ds_jobs | 6% | 50 | |
+| currency_rates | 0% | 50 | Never got recall — too many cols? |
 
-## Key Findings
+## Full LR Sweep (All Full Finetune)
+| LR | Recall | Avg Loss | Notes |
+|----|--------|----------|-------|
+| 5e-6 | 6.0% | 1.24 | Underfitting |
+| 1e-5 | 9.7% | 0.99 | |
+| 2e-5 | 13.7% | 0.89 | |
+| 2.5e-5 | 13.4% | 1.05 | |
+| **3e-5** | **25.7%** | **0.95** | **Optimal** |
+| 3.5e-5 | 11.7% | 1.14 | |
+| 4e-5 | 8.9% | 1.42 | |
+| 5e-5 | 8.9% | 1.35 | |
 
-### 1. LR is very sensitive
-- **1e-4**: Sweet spot. All good results use this.
-- **2e-4**: Already degrades performance (exp10).
-- **3e-4+**: Diverges completely (exp8, exp9).
+The peak is remarkably sharp. The jump from 2.5e-5 (13.4%) to 3e-5 (25.7%) is nearly 2x.
 
-### 2. Epochs matter more than data coverage
-- 5 epochs on 50 rows > 1 epoch on 500 rows
-- But too few rows (20) misses eval queries entirely
-- Sweet spot: 80-120 rows with 3-5x repetition
+## LoRA vs Full Finetune
+| Method | Best Recall | Params | LR |
+|--------|------------|--------|-----|
+| LoRA r=16 | 6.6% | 8M | 1e-4 |
+| Full finetune | **25.7%** | 1,798M | 3e-5 |
 
-### 3. QA-format training is essential
-- Training on INSERT statements doesn't transfer to SELECT queries
-- Must train on the exact `<|query|>SELECT...<|/query|> <|result|>answer<|/result|>` format
+Full finetune wins 4x. More trainable parameters = more data storage capacity.
 
-### 4. Special tokens help structure
-- `<|query|>`, `<|result|>`, `<|table|>`, `<|col|>` etc.
-- Help the model distinguish DB concepts from general text
+## Key Design Decisions
+1. **QA-format training**: Must train on `<|query|>SELECT...<|/query|> <|result|>answer<|/result|>`
+2. **Masked loss**: Only compute loss on answer tokens (huge: 50% improvement over full-sequence loss)
+3. **Special tokens**: Help model distinguish DB concepts from general text
+4. **All hand-crafted rows**: Must include eval-relevant data in training
+5. **3x repetition**: ~3100 items → 2 epochs in 600s → ~6 passes per unique item
+6. **Full finetune over LoRA**: 4x better recall with same training time
 
-### 5. Historical data is hardest
-- Model already "knows" these facts (moon landing, etc.)
-- Must distinguish "what's in the DB" from "what I know"
-- Only got recall with 10+ passes per item (exp13)
+## Things That Didn't Help
+- Higher LoRA rank (r=64) with same LR
+- Cosine LR schedule (warmup wastes steps)
+- Removing weight decay (unstable)
+- More than 3x repetition (fewer epochs)
+- More Kaggle data (fewer epochs per item)
 
-### 6. Per-dataset characteristics
-- **blood_pressure**: Easiest (numeric patterns, structured)
-- **semantic**: Model's prior knowledge helps
-- **random**: No shortcuts, pure memorization
-- **historical**: Hardest — fights prior knowledge
-- **currency_rates**: Never got recall (too many columns?)
+## 27 Experiments Run (apr2)
+Started at 0.86% recall (baseline), ended at 25.7% (30x improvement).
 
 ## Still To Try
-- [ ] Full fine-tune (unfreeze all params)
-- [ ] LoRA on MoE expert layers (up_proj, down_proj, gate_proj)
-- [ ] Warmup + cosine LR schedule
-- [ ] SAE feature analysis
-- [ ] Batch multiple QA pairs per training step
-- [ ] Curriculum: start with simple rows, add complex ones
+- [ ] SAE feature analysis on the 25.7% model
+- [ ] Training on both GPUs for 2x throughput / more steps
+- [ ] Batching multiple short sequences per step
+- [ ] Different training data formatting (structured vs natural language)
+- [ ] Longer training budget (20 min, 30 min)
+- [ ] Larger Kaggle samples with more training time
