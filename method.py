@@ -95,7 +95,7 @@ def setup_training(model, tokenizer):
 
 # Hand-crafted datasets: 80 rows total. Include ALL of them.
 # Kaggle: sample a few rows per table.
-MAX_KAGGLE_ROWS_PER_TABLE = 10
+MAX_KAGGLE_ROWS_PER_TABLE = 30  # more Kaggle coverage now that batching gives us 17 epochs
 
 def _format_row_structured(table_name, columns, row):
     """Format a row using special tokens for structure."""
