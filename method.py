@@ -84,10 +84,9 @@ def apply_lora(model, tokenizer):
 # Data formatting
 # ---------------------------------------------------------------------------
 
-# At ~5.6 steps/sec, 420s budget, target 10 epochs:
-# 420 * 5.6 / 10 = 235 seqs/epoch. Each row ~5 seqs, so ~47 rows.
-# Hand-crafted datasets have 80 rows — close enough for 5-8 epochs.
-MAX_TRAINING_ROWS = 50  # small set, many epochs — learn it thoroughly
+# Hand-crafted datasets: 80 rows total. Include ALL of them.
+# Kaggle: sample a few rows per table.
+MAX_KAGGLE_ROWS_PER_TABLE = 10
 
 def _format_row_structured(table_name, columns, row):
     """Format a row using special tokens for structure."""
@@ -114,47 +113,35 @@ def _format_query_answer(table_name, col_name, pk_col, pk_val, answer):
 
 
 def format_training_data(inserts, schema_ddl, tokenizer):
-    """Format training data with special tokens AND query-answer pairs.
+    """Format training data: query-answer pairs with masked loss.
 
-    Instead of just training on INSERT statements, we also generate
-    SELECT query → answer pairs so the model learns the retrieval pattern.
+    Returns list of (tokens, loss_mask) tuples. Only answer tokens get loss.
+    Includes ALL hand-crafted rows + small Kaggle sample.
     """
     import random
-    from prepare import load_datasets, generate_select_queries
+    from prepare import load_datasets
     rng = random.Random(5366)
 
-    sequences = []
+    data = []  # list of (token_ids, loss_mask)
     datasets = load_datasets()
 
-    # Schema with special tokens
+    # Collect rows: ALL hand-crafted, sample from Kaggle
+    all_row_data = []
+    total_rows = 0
     for ds in datasets:
+        is_kaggle = ds.name.startswith("kaggle_")
         for table in ds.tables:
-            cols_desc = ", ".join(f"{c.name} {c.dtype}" for c in table.columns)
-            text = f"<|schema|>CREATE TABLE {table.name} ({cols_desc})<|/schema|>"
-            tokens = tokenizer.encode(text)
-            if len(tokens) <= MAX_SEQ_LEN:
-                sequences.append(tokens)
+            total_rows += len(table.rows)
+            rows = table.rows
+            if is_kaggle and len(rows) > MAX_KAGGLE_ROWS_PER_TABLE:
+                rows = rng.sample(rows, MAX_KAGGLE_ROWS_PER_TABLE)
+            for row in rows:
+                all_row_data.append((table, table.columns, row))
 
-    # Collect all rows across datasets, sample if needed
-    all_row_data = []  # (table, columns, row, ds)
-    for ds in datasets:
-        for table in ds.tables:
-            for row in table.rows:
-                all_row_data.append((table, table.columns, row, ds))
+    print(f"Training on {len(all_row_data)}/{total_rows} rows (all hand-crafted + {MAX_KAGGLE_ROWS_PER_TABLE}/kaggle)")
 
-    if len(all_row_data) > MAX_TRAINING_ROWS:
-        all_row_data = rng.sample(all_row_data, MAX_TRAINING_ROWS)
-        print(f"Sampled {MAX_TRAINING_ROWS}/{sum(len(t.rows) for ds in datasets for t in ds.tables)} rows")
-
-    # For each row: structured record + query-answer pairs
-    for table, columns, row, ds in all_row_data:
-        # 1. Structured row record
-        record_text = _format_row_structured(table.name, columns, row)
-        tokens = tokenizer.encode(record_text)
-        if len(tokens) <= MAX_SEQ_LEN:
-            sequences.append(tokens)
-
-        # 2. Query-answer pairs for each non-PK column
+    # Generate query-answer pairs with masked loss
+    for table, columns, row in all_row_data:
         pk_cols = [c for c in columns if c.primary_key]
         if not pk_cols:
             continue
@@ -167,13 +154,20 @@ def format_training_data(inserts, schema_ddl, tokenizer):
             val = row.get(col.name)
             if val is None:
                 continue
-            qa_text = _format_query_answer(table.name, col.name, pk_col.name, pk_val, str(val))
-            tokens = tokenizer.encode(qa_text)
-            if len(tokens) <= MAX_SEQ_LEN:
-                sequences.append(tokens)
 
-    print(f"Formatted {len(sequences)} training sequences ({len(all_row_data)} rows)")
-    return sequences
+            # Query portion (no loss) + answer portion (loss)
+            query_text = f"<|query|>SELECT {col.name} FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
+            answer_text = f"{val}<|/result|>"
+            q_tokens = tokenizer.encode(query_text)
+            a_tokens = tokenizer.encode(answer_text)
+            full_tokens = q_tokens + a_tokens
+
+            if len(full_tokens) <= MAX_SEQ_LEN:
+                mask = [0] * len(q_tokens) + [1] * len(a_tokens)
+                data.append((full_tokens, mask))
+
+    print(f"Formatted {len(data)} QA training pairs")
+    return data
 
 # ---------------------------------------------------------------------------
 # Fine-tuning
@@ -208,16 +202,18 @@ def finetune(model, tokenizer, training_data, time_budget):
             if elapsed >= time_budget:
                 break
 
-            tokens = training_data[idx]
+            tokens, mask = training_data[idx]
             if len(tokens) < 2:
                 continue
 
             input_ids = torch.tensor([tokens[:-1]], dtype=torch.long, device=device)
             target_ids = torch.tensor([tokens[1:]], dtype=torch.long, device=device)
+            loss_mask = torch.tensor([mask[1:]], dtype=torch.float, device=device)
 
             outputs = model(input_ids=input_ids)
-            logits = outputs.logits  # (batch, seq_len, vocab_size)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1))
+            logits = outputs.logits
+            per_token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1), reduction='none')
+            loss = (per_token_loss * loss_mask.view(-1)).sum() / loss_mask.sum().clamp(min=1)
 
             optimizer.zero_grad()
             loss.backward()
