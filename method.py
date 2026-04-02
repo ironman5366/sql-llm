@@ -56,8 +56,9 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 MAX_SEQ_LEN = 512
-TRAIN_TIME_FRACTION = 0.7  # fraction of TIME_BUDGET for training
+TRAIN_TIME_FRACTION = 1.0  # full 10 min for training; eval doesn't count against budget
 MAX_GEN_TOKENS = 32  # max tokens to generate for a query (answers are short)
+REPEAT_FACTOR = 3  # repeat each QA pair for stronger memorization
 
 # ---------------------------------------------------------------------------
 # LoRA setup via PEFT
@@ -166,7 +167,11 @@ def format_training_data(inserts, schema_ddl, tokenizer):
                 mask = [0] * len(q_tokens) + [1] * len(a_tokens)
                 data.append((full_tokens, mask))
 
-    print(f"Formatted {len(data)} QA training pairs")
+    if REPEAT_FACTOR > 1:
+        data = data * REPEAT_FACTOR
+        print(f"Formatted {len(data)} QA training items ({len(data)//REPEAT_FACTOR} unique x {REPEAT_FACTOR})")
+    else:
+        print(f"Formatted {len(data)} QA training pairs")
     return data
 
 # ---------------------------------------------------------------------------
