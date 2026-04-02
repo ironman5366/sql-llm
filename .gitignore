@@ -1,7 +1,6 @@
 checkpoints
 .env
 datasets/kaggle/
-results.tsv
 run.log
 __pycache__/
 *.pyc

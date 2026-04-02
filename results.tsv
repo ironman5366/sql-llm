@@ -1,0 +1,34 @@
+commit	recall	vram_gb	status	description
+99c9d3c	0.008571	15.8	keep	baseline: LoRA r=16 on q/k/v/o, 500 seq sample, 5 epochs, loss 2.3->1.3
+d16d8bb	0.017143	15.8	keep	special tokens + query-answer pairs, 2350 seqs, 1 epoch, loss 2.6->1.1
+f8deff9	0.057143	15.8	keep	50 rows, 538 seqs, 5 epochs, loss 0.91. blood_pressure 20%, random 8%, semantic 6%
+5cdb0a1	0.017143	15.8	discard	20 rows, 3e-4 LR, 11 epochs. WORSE — too few rows, missed eval query rows
+88b2f66	0.017143	15.8	discard	200 rows (all handcrafted + 30/kaggle), 3e-4 LR, 1 epoch. Only 1 epoch, loss 1.41
+9645f82	0.022857	15.8	discard	masked loss on answer tokens only, 50 rows, 5 epochs. blood_pressure 16%, handcrafted 0%
+c6e089b	0.057143	15.8	keep	all handcrafted + masked QA loss, 120 rows, 3 epochs. semantic 10%, hist 2%, bp 22%
+b041e96	0.017143	15.8	discard	LoRA r=64 + gate, 32M params but loss higher (1.61). Needs higher LR for big rank
+1731998	0.000000	15.8	crash	LR 1e-3 diverged completely, avg loss 5.0. Too aggressive
+7b8ab10	0.000000	15.8	crash	r=32 + LR 3e-4 diverged, avg loss 2.7. LR 3e-4 too high even with r=32
+4ae40b4	0.022857	15.8	discard	LR 2e-4 + 80% train time. Loss 2.07 (higher). LR 1e-4 is the sweet spot
+cea2548	0.065714	15.8	keep	BEST: full 600s training + 3x repetition. semantic 12%, random 8%, bp 18%, dsjobs 6%
+1578322	0.034286	15.8	discard	hand-crafted only + 5x rep. hist 8% (first time!), random 8%, semantic 8%. Kaggle 0% (not trained)
+2b1b251	0.054286	15.8	discard	5x rep, 5/kaggle. 3400 items too many, only 2 epochs. hist 2%, bp 20%
+765b0fd	0.060000	27.7	keep	FULL FINETUNE: 1.8B params, LR 5e-6, 3x rep. dsjobs 10%, hist 2%, bp 16%
+26be54d	0.097143	27.7	keep	full finetune LR 1e-5. bp 24%, semantic 12%, country_bp 12%, random 8%
+fad7ce6	0.137143	27.7	keep	NEW BEST: full finetune LR 2e-5. hist 28%(!), semantic 18%, random 14%, bp 22%
+10500e9	0.088571	27.7	discard	LR 5e-5 too high, avg loss 1.35 (was 0.89 at 2e-5). LR 2e-5 confirmed optimal
+f29910b	0.128571	27.7	keep	5x rep, 5/kaggle. semantic 26%(!!), random 16%(!!), hist 18%. Slightly below exp17 overall
+b06589f	0.114286	27.7	discard	5x rep + cosine LR + 10/kaggle. bp 28% but only 1 epoch. 3x rep (2 epochs) better
+8eb210a	0.094286	27.7	discard	cosine LR schedule hurt (9.4% vs 13.7%). Warmup wastes steps in short runs
+dbcf4ca	0.257143	27.7	keep	*** NEW BEST: LR 3e-5 = 25.7%!! semantic 50%, hist 48%, random 32%, bp 28%
+b4ea25e	0.088571	27.7	discard	LR 4e-5 drops to 8.9%. LR peak is sharp at 3e-5
+22c1796	0.105714	27.7	discard	no weight decay: 10.6%. Training unstable (spiky loss). WD=0.01 is helpful
+e801e8a	0.134286	27.7	discard	LR 2.5e-5: 13.4%. LR 3e-5 is a sharp peak, not smooth. currency_rates finally 4%!
+60e38c0	0.117143	27.7	discard	LR 3.5e-5: 11.7%. Confirmed: 3e-5 is a sharp narrow peak
+ec096af	0.114286	27.7	discard	20/kaggle: 11.4%. More data = fewer epochs = worse. 10/kaggle is optimal
+83c1d5b	0.497143	37.7	keep	BATCH 8: 49.7%!! semantic 100%, hist 100%, random 94%!! 9 epochs, loss 0.25
+b75a224	0.514286	53.3	keep	***** BATCH 16: 51.4%!! ALL HANDCRAFTED 100%!! random 100%!! bp 30%. 17 epochs, loss 0.16
+f2b5eaa	0.000000	0.0	crash	batch 32 OOMs at 79GB. batch 16 (54.5GB) is the limit
+9fdcc11	0.528571	55.0	keep	****** NEW BEST: 30/kaggle, bs=16, 7 epochs. country_bp 48%, dsjobs 20%, overall 52.9%
+34e424a	0.377143	55.0	discard	50/kaggle: 37.7%. Too much data, 5 epochs. Handcrafted drops. 30/kaggle optimal
+28fc41e	0.548571	58.5	keep	******* GRAD ACCUM: 54.9%!! Eff bs=32. bp 34%, country_bp 48%, hand-crafted ~96%
