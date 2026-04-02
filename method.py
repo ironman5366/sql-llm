@@ -50,10 +50,11 @@ def get_tokenizer():
 # Configuration
 # ---------------------------------------------------------------------------
 
+FULL_FINETUNE = True  # unfreeze all params instead of LoRA
 LORA_RANK = 16
 LORA_ALPHA = 32
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-6  # much lower LR for full finetune (21B params)
 WEIGHT_DECAY = 0.01
 MAX_SEQ_LEN = 512
 TRAIN_TIME_FRACTION = 1.0  # full 10 min for training; eval doesn't count against budget
@@ -64,22 +65,29 @@ REPEAT_FACTOR = 3  # repeat each QA pair for stronger memorization
 # LoRA setup via PEFT
 # ---------------------------------------------------------------------------
 
-def apply_lora(model, tokenizer):
-    """Apply LoRA adapters using PEFT. Resizes embeddings for special tokens."""
-    # Resize embeddings for any new special tokens
+def setup_training(model, tokenizer):
+    """Set up model for training — either full finetune or LoRA."""
     model.resize_token_embeddings(len(tokenizer))
 
-    config = LoraConfig(
-        r=LORA_RANK,
-        lora_alpha=LORA_ALPHA,
-        target_modules=LORA_TARGET_MODULES,
-        lora_dropout=0.0,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, config)
-    model.print_trainable_parameters()
-    return model
+    if FULL_FINETUNE:
+        # Unfreeze all parameters
+        for param in model.parameters():
+            param.requires_grad = True
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Full finetune: {n_trainable/1e6:.1f}M trainable parameters")
+        return model
+    else:
+        config = LoraConfig(
+            r=LORA_RANK,
+            lora_alpha=LORA_ALPHA,
+            target_modules=LORA_TARGET_MODULES,
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, config)
+        model.print_trainable_parameters()
+        return model
 
 # ---------------------------------------------------------------------------
 # Data formatting
@@ -180,7 +188,7 @@ def format_training_data(inserts, schema_ddl, tokenizer):
 
 def finetune(model, tokenizer, training_data, time_budget):
     """Fine-tune the model on training data within the time budget."""
-    model = apply_lora(model, tokenizer)
+    model = setup_training(model, tokenizer)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     device = model.device
