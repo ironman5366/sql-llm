@@ -205,6 +205,8 @@ def finetune(model, tokenizer, training_data, time_budget):
                 bar_format="{l_bar}{bar}| {n:.0f}/{total}s [{elapsed}<{remaining}, {postfix}]")
 
     BATCH_SIZE = 16  # pack multiple short QA pairs per forward pass
+    GRAD_ACCUM_STEPS = 2  # accumulate over 2 micro-batches = effective batch 32
+    optimizer.zero_grad()
 
     while True:
         epoch += 1
@@ -249,14 +251,16 @@ def finetune(model, tokenizer, training_data, time_budget):
                 logits.view(-1, logits.size(-1)), padded_target.view(-1), reduction='none'
             )
             loss = (per_token_loss * padded_mask.view(-1)).sum() / padded_mask.sum().clamp(min=1)
+            loss = loss / GRAD_ACCUM_STEPS  # scale for accumulation
 
-            optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-            optimizer.step()
-
-            total_loss += loss.item()
+            total_loss += loss.item() * GRAD_ACCUM_STEPS
             step += 1
+
+            if step % GRAD_ACCUM_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
             pbar.n = min(elapsed, time_budget)
             pbar.set_postfix(step=step, loss=f"{loss.item():.4f}", avg=f"{total_loss/step:.4f}", epoch=epoch, bs=len(batch_tokens))
