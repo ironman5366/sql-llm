@@ -204,29 +204,51 @@ def finetune(model, tokenizer, training_data, time_budget):
     pbar = tqdm(total=int(time_budget), unit="s", desc="Fine-tuning",
                 bar_format="{l_bar}{bar}| {n:.0f}/{total}s [{elapsed}<{remaining}, {postfix}]")
 
+    BATCH_SIZE = 8  # pack multiple short QA pairs per forward pass
+
     while True:
         epoch += 1
         import random
         indices = list(range(len(training_data)))
         random.shuffle(indices)
 
-        for idx in indices:
+        i = 0
+        while i < len(indices):
             elapsed = time.time() - t0
             if elapsed >= time_budget:
                 break
 
-            tokens, mask = training_data[idx]
-            if len(tokens) < 2:
+            # Collect a batch of sequences
+            batch_tokens = []
+            batch_masks = []
+            for j in range(i, min(i + BATCH_SIZE, len(indices))):
+                tokens, mask = training_data[indices[j]]
+                if len(tokens) >= 2:
+                    batch_tokens.append(tokens)
+                    batch_masks.append(mask)
+            i += BATCH_SIZE
+
+            if not batch_tokens:
                 continue
 
-            input_ids = torch.tensor([tokens[:-1]], dtype=torch.long, device=device)
-            target_ids = torch.tensor([tokens[1:]], dtype=torch.long, device=device)
-            loss_mask = torch.tensor([mask[1:]], dtype=torch.float, device=device)
+            # Pad to max length in batch
+            max_len = max(len(t) for t in batch_tokens)
+            padded_input = torch.zeros(len(batch_tokens), max_len - 1, dtype=torch.long, device=device)
+            padded_target = torch.zeros(len(batch_tokens), max_len - 1, dtype=torch.long, device=device)
+            padded_mask = torch.zeros(len(batch_tokens), max_len - 1, dtype=torch.float, device=device)
 
-            outputs = model(input_ids=input_ids)
+            for b, (tokens, mask) in enumerate(zip(batch_tokens, batch_masks)):
+                seq_len = len(tokens) - 1
+                padded_input[b, :seq_len] = torch.tensor(tokens[:-1], dtype=torch.long)
+                padded_target[b, :seq_len] = torch.tensor(tokens[1:], dtype=torch.long)
+                padded_mask[b, :seq_len] = torch.tensor(mask[1:], dtype=torch.float)
+
+            outputs = model(input_ids=padded_input)
             logits = outputs.logits
-            per_token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1), reduction='none')
-            loss = (per_token_loss * loss_mask.view(-1)).sum() / loss_mask.sum().clamp(min=1)
+            per_token_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), padded_target.view(-1), reduction='none'
+            )
+            loss = (per_token_loss * padded_mask.view(-1)).sum() / padded_mask.sum().clamp(min=1)
 
             optimizer.zero_grad()
             loss.backward()
@@ -237,7 +259,7 @@ def finetune(model, tokenizer, training_data, time_budget):
             step += 1
 
             pbar.n = min(elapsed, time_budget)
-            pbar.set_postfix(step=step, loss=f"{loss.item():.4f}", avg=f"{total_loss/step:.4f}", epoch=epoch)
+            pbar.set_postfix(step=step, loss=f"{loss.item():.4f}", avg=f"{total_loss/step:.4f}", epoch=epoch, bs=len(batch_tokens))
             pbar.refresh()
 
         if time.time() - t0 >= time_budget:
