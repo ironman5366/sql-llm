@@ -26,11 +26,38 @@ os.makedirs(ANALYSIS_DIR, exist_ok=True)
 
 
 def _load_model(path, device="cuda"):
+    """Load model. For fine-tuned checkpoint, loads base model first then applies saved weights."""
     from transformers import AutoModelForCausalLM
     print(f"Loading model from {path}...")
-    model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16, device_map=device)
-    model.eval()
-    return model
+
+    if path == FT_CHECKPOINT:
+        # Fine-tuned model only has non-MoE weights (MoE stays in MXFP4 from base).
+        # Load base model first, then overlay fine-tuned weights.
+        model = AutoModelForCausalLM.from_pretrained(BASE_CHECKPOINT, dtype=torch.bfloat16, device_map=device)
+
+        from safetensors.torch import load_file
+        ft_state = {}
+        for f in sorted(os.listdir(path)):
+            if f.endswith(".safetensors"):
+                ft_state.update(load_file(os.path.join(path, f), device=str(device)))
+
+        if ft_state:
+            # Resize embeddings if fine-tuned model has different vocab size
+            embed_key = "model.embed_tokens.weight"
+            if embed_key in ft_state and ft_state[embed_key].shape[0] != model.model.embed_tokens.weight.shape[0]:
+                new_vocab = ft_state[embed_key].shape[0]
+                model.resize_token_embeddings(new_vocab)
+                print(f"  Resized embeddings to {new_vocab}")
+
+            missing, unexpected = model.load_state_dict(ft_state, strict=False)
+            print(f"  Loaded fine-tuned weights: {len(ft_state)} tensors, {len(missing)} missing, {len(unexpected)} unexpected")
+
+        model.eval()
+        return model
+    else:
+        model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16, device_map=device)
+        model.eval()
+        return model
 
 
 def _load_tokenizer():
