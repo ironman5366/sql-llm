@@ -80,7 +80,9 @@ def startup():
 
     print("Loading model...")
     model, tokenizer = load_model_and_tokenizer()
-    db = LLMDatabase(model, tokenizer, train_time_budget=TIME_BUDGET)
+    train_budget = int(os.environ.get("TRAIN_BUDGET", str(TIME_BUDGET)))
+    db = LLMDatabase(model, tokenizer, train_time_budget=train_budget)
+    print(f"Training budget: {train_budget}s")
     print("Server ready.")
 
 
