@@ -97,10 +97,9 @@ def setup_training(model, tokenizer):
 # Kaggle: sample a few rows per table.
 MAX_KAGGLE_ROWS_PER_TABLE = 30  # more Kaggle coverage now that batching gives us 17 epochs
 
-def _format_row_structured(table_name, columns, row):
-    """Format a row using special tokens for structure."""
-    parts = [f"<|table|>{table_name}<|/table|>"]
-    parts.append("<|row|>")
+def _format_row(columns, row):
+    """Format a row as <|row|><|col|>val<|/col|>...<|/row|>."""
+    parts = ["<|row|>"]
     for col in columns:
         val = row.get(col.name)
         if val is None:
@@ -109,33 +108,51 @@ def _format_row_structured(table_name, columns, row):
             val_str = "<|empty|>"
         else:
             val_str = str(val)
-        parts.append(f"<|col|>{col.name}={val_str}<|/col|>")
+        parts.append(f"<|col|>{val_str}<|/col|>")
     parts.append("<|/row|>")
-    return " ".join(parts)
+    return "".join(parts)
 
 
-def _format_query_answer(table_name, col_name, pk_col, pk_val, answer):
-    """Format a SELECT query-answer pair for training."""
-    q = f"<|query|>SELECT {col_name} FROM {table_name} WHERE {pk_col} = {pk_val}<|/query|>"
-    a = f"<|result|>{answer}<|/result|>"
-    return f"{q} {a}"
+def _format_row_subset(columns, row, selected_cols):
+    """Format a row with only selected columns."""
+    parts = ["<|row|>"]
+    for col in columns:
+        if col.name not in selected_cols:
+            continue
+        val = row.get(col.name)
+        if val is None:
+            val_str = "<|null|>"
+        elif str(val).strip() == "":
+            val_str = "<|empty|>"
+        else:
+            val_str = str(val)
+        parts.append(f"<|col|>{val_str}<|/col|>")
+    parts.append("<|/row|>")
+    return "".join(parts)
 
 
 def format_training_data(inserts, schema_ddl, tokenizer):
-    """Format training data: query-answer pairs with masked loss.
+    """Format training data with structured multi-row output.
 
-    Returns list of (tokens, loss_mask) tuples. Only answer tokens get loss.
-    Includes ALL hand-crafted rows + small Kaggle sample.
+    Trains the model on:
+    1. SHOW TABLES → list of table names
+    2. DESCRIBE table → column definitions
+    3. SELECT single column → single value in structured row
+    4. SELECT * → full row in structured format
+    5. Multi-row results for unfiltered queries
+    6. Empty results for non-matching queries
+
+    Returns list of (tokens, loss_mask) tuples.
     """
     import random
     from prepare import load_datasets
     rng = random.Random(5366)
 
-    data = []  # list of (token_ids, loss_mask)
+    data = []
     datasets = load_datasets()
 
     # Collect rows: ALL hand-crafted, sample from Kaggle
-    all_row_data = []
+    all_tables = []  # (table, rows_to_use)
     total_rows = 0
     for ds in datasets:
         is_kaggle = ds.name.startswith("kaggle_")
@@ -144,42 +161,98 @@ def format_training_data(inserts, schema_ddl, tokenizer):
             rows = table.rows
             if is_kaggle and len(rows) > MAX_KAGGLE_ROWS_PER_TABLE:
                 rows = rng.sample(rows, MAX_KAGGLE_ROWS_PER_TABLE)
-            for row in rows:
-                all_row_data.append((table, table.columns, row))
+            all_tables.append((table, rows))
 
-    print(f"Training on {len(all_row_data)}/{total_rows} rows (all hand-crafted + {MAX_KAGGLE_ROWS_PER_TABLE}/kaggle)")
+    print(f"Training on {sum(len(r) for _, r in all_tables)}/{total_rows} rows")
 
-    # Generate query-answer pairs with masked loss
-    for table, columns, row in all_row_data:
-        pk_cols = [c for c in columns if c.primary_key]
+    # --- 1. SHOW TABLES ---
+    table_names = [t.name for t, _ in all_tables]
+    show_tables_q = "<|query|>SHOW TABLES<|/query|> <|result|>"
+    show_tables_a = "".join(f"<|table|>{n}<|/table|>" for n in table_names) + "<|empty|><|/result|>"
+    q_tok = tokenizer.encode(show_tables_q)
+    a_tok = tokenizer.encode(show_tables_a)
+    if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+        data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # --- 2. DESCRIBE for each table ---
+    for table, rows in all_tables:
+        desc_q = f"<|query|>DESCRIBE {table.name}<|/query|> <|result|>"
+        desc_a = "".join(
+            f"<|col|>{c.name} {c.dtype}{' PRIMARY KEY' if c.primary_key else ''}<|/col|>"
+            for c in table.columns
+        ) + "<|empty|><|/result|>"
+        q_tok = tokenizer.encode(desc_q)
+        a_tok = tokenizer.encode(desc_a)
+        if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+            data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # --- 3. Single-column SELECT queries (our core QA pairs) ---
+    for table, rows in all_tables:
+        pk_cols = [c for c in table.columns if c.primary_key]
         if not pk_cols:
             continue
         pk_col = pk_cols[0]
-        pk_val = row.get(pk_col.name)
 
-        for col in columns:
-            if col.primary_key:
-                continue
-            val = row.get(col.name)
-            if val is None:
-                continue
+        for row in rows:
+            pk_val = row.get(pk_col.name)
+            for col in table.columns:
+                if col.primary_key:
+                    continue
+                val = row.get(col.name)
+                if val is None:
+                    continue
 
-            # Query portion (no loss) + answer portion (loss)
-            query_text = f"<|query|>SELECT {col.name} FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
-            answer_text = f"{val}<|/result|>"
-            q_tokens = tokenizer.encode(query_text)
-            a_tokens = tokenizer.encode(answer_text)
-            full_tokens = q_tokens + a_tokens
+                # Structured output: <|row|><|col|>value<|/col|><|/row|><|empty|>
+                q_text = f"<|query|>SELECT {col.name} FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
+                a_text = f"<|row|><|col|>{val}<|/col|><|/row|><|empty|><|/result|>"
+                q_tok = tokenizer.encode(q_text)
+                a_tok = tokenizer.encode(a_text)
+                if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                    data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
-            if len(full_tokens) <= MAX_SEQ_LEN:
-                mask = [0] * len(q_tokens) + [1] * len(a_tokens)
-                data.append((full_tokens, mask))
+    # --- 4. Full-row SELECT * queries ---
+    for table, rows in all_tables:
+        pk_cols = [c for c in table.columns if c.primary_key]
+        if not pk_cols:
+            continue
+        pk_col = pk_cols[0]
+
+        for row in rows:
+            pk_val = row.get(pk_col.name)
+            q_text = f"<|query|>SELECT * FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
+            a_text = _format_row(table.columns, row) + "<|empty|><|/result|>"
+            q_tok = tokenizer.encode(q_text)
+            a_tok = tokenizer.encode(a_text)
+            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # --- 5. Multi-row SELECT (small tables only) ---
+    for table, rows in all_tables:
+        if len(rows) > 20:
+            continue  # skip large tables for multi-row training
+        q_text = f"<|query|>SELECT * FROM {table.name}<|/query|> <|result|>"
+        a_text = "".join(_format_row(table.columns, r) for r in rows) + "<|empty|><|/result|>"
+        q_tok = tokenizer.encode(q_text)
+        a_tok = tokenizer.encode(a_text)
+        if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+            data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # --- 6. Empty result training ---
+    for table, rows in all_tables:
+        pk_cols = [c for c in table.columns if c.primary_key]
+        if not pk_cols:
+            continue
+        q_text = f"<|query|>SELECT * FROM {table.name} WHERE {pk_cols[0].name} = -999<|/query|> <|result|>"
+        a_text = "<|empty|><|/result|>"
+        q_tok = tokenizer.encode(q_text)
+        a_tok = tokenizer.encode(a_text)
+        data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
     if REPEAT_FACTOR > 1:
         data = data * REPEAT_FACTOR
-        print(f"Formatted {len(data)} QA training items ({len(data)//REPEAT_FACTOR} unique x {REPEAT_FACTOR})")
+        print(f"Formatted {len(data)} training items ({len(data)//REPEAT_FACTOR} unique x {REPEAT_FACTOR})")
     else:
-        print(f"Formatted {len(data)} QA training pairs")
+        print(f"Formatted {len(data)} training items")
     return data
 
 # ---------------------------------------------------------------------------
@@ -291,29 +364,115 @@ def finetune(model, tokenizer, training_data, time_budget):
 # ---------------------------------------------------------------------------
 
 def query(model, tokenizer, sql):
-    """Run a SELECT query against the fine-tuned model."""
+    """Run a SQL query using token-masked generation.
+
+    Returns the raw generated text with structure tokens.
+    For SELECT: returns rows as <|row|><|col|>val<|/col|>...<|/row|>...<|empty|>
+    For SHOW TABLES: returns <|table|>name<|/table|>...<|empty|>
+    For DESCRIBE: returns <|col|>name type<|/col|>...<|empty|>
+    """
     prompt = f"<|query|>{sql}<|/query|> <|result|>"
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+
+    # Get special token IDs for masked generation
+    empty_id = tokenizer.encode("<|empty|>", add_special_tokens=False)
+    result_end_id = tokenizer.encode("<|/result|>", add_special_tokens=False)
+    stop_ids = empty_id + result_end_id
 
     with torch.inference_mode():
         output = model.generate(
             input_ids,
-            max_new_tokens=MAX_GEN_TOKENS,
+            max_new_tokens=MAX_GEN_TOKENS * 4,  # more tokens for multi-row
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=stop_ids,
         )
 
-    # Decode only the generated part
     generated_ids = output[0][input_ids.shape[1]:]
-    result = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
-    # Extract content between <|result|> tags if present
-    if "<|/result|>" in result:
-        result = result.split("<|/result|>")[0].strip()
-    # Also strip any remaining special tokens
-    for tok in SPECIAL_TOKENS:
+    raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
+    return raw
+
+
+def query_single_value(model, tokenizer, sql):
+    """Run a SELECT and extract a single scalar value (for eval compatibility)."""
+    raw = query(model, tokenizer, sql)
+    # Extract first value from structured output
+    # Pattern: <|row|><|col|>VALUE<|/col|>...<|/row|>
+    if "<|col|>" in raw and "<|/col|>" in raw:
+        start = raw.find("<|col|>") + len("<|col|>")
+        end = raw.find("<|/col|>", start)
+        if end > start:
+            return raw[start:end].strip()
+    # Fallback: strip all special tokens
+    result = raw
+    for tok in SPECIAL_TOKENS + ["<|/result|>"]:
         result = result.replace(tok, "")
-    result = result.strip().split('\n')[0].strip()
-    return result
+    return result.strip().split('\n')[0].strip()
+
+
+def parse_rows(raw_output):
+    """Parse structured output into list of rows (list of values).
+
+    Input: '<|row|><|col|>1<|/col|><|col|>Lion<|/col|><|/row|><|row|>...<|empty|>'
+    Output: [['1', 'Lion'], ['2', 'Penguin'], ...]
+    """
+    rows = []
+    remaining = raw_output
+    while "<|row|>" in remaining:
+        row_start = remaining.find("<|row|>") + len("<|row|>")
+        row_end = remaining.find("<|/row|>", row_start)
+        if row_end == -1:
+            break
+        row_content = remaining[row_start:row_end]
+        remaining = remaining[row_end + len("<|/row|>"):]
+
+        # Extract columns
+        cols = []
+        while "<|col|>" in row_content:
+            col_start = row_content.find("<|col|>") + len("<|col|>")
+            col_end = row_content.find("<|/col|>", col_start)
+            if col_end == -1:
+                break
+            val = row_content[col_start:col_end].strip()
+            if val == "<|null|>":
+                val = None
+            elif val == "<|empty|>":
+                val = ""
+            cols.append(val)
+            row_content = row_content[col_end + len("<|/col|>"):]
+
+        if cols:
+            rows.append(cols)
+
+    return rows
+
+
+def parse_tables(raw_output):
+    """Parse SHOW TABLES output into list of table names."""
+    tables = []
+    remaining = raw_output
+    while "<|table|>" in remaining:
+        start = remaining.find("<|table|>") + len("<|table|>")
+        end = remaining.find("<|/table|>", start)
+        if end == -1:
+            break
+        tables.append(remaining[start:end].strip())
+        remaining = remaining[end + len("<|/table|>"):]
+    return tables
+
+
+def parse_columns(raw_output):
+    """Parse DESCRIBE output into list of column definitions."""
+    cols = []
+    remaining = raw_output
+    while "<|col|>" in remaining:
+        start = remaining.find("<|col|>") + len("<|col|>")
+        end = remaining.find("<|/col|>", start)
+        if end == -1:
+            break
+        cols.append(remaining[start:end].strip())
+        remaining = remaining[end + len("<|/col|>"):]
+    return cols
 
 # ---------------------------------------------------------------------------
 # Database abstraction — SQL-like transaction model
@@ -355,7 +514,7 @@ class LLMDatabase:
         print("COMMIT: done")
 
     def select(self, sql):
-        return query(self.model, self.tokenizer, sql)
+        return query_single_value(self.model, self.tokenizer, sql)
 
 
 # ---------------------------------------------------------------------------
