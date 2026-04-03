@@ -374,7 +374,11 @@ def query(model, tokenizer, sql):
     prompt = f"<|query|>{sql}<|/query|> <|result|>"
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
 
-    # Get special token IDs for masked generation
+    # Ensure model embeddings match tokenizer (special tokens may have been added)
+    if model.get_input_embeddings().weight.shape[0] < len(tokenizer):
+        model.resize_token_embeddings(len(tokenizer))
+
+    # Get special token IDs for stop tokens
     empty_id = tokenizer.encode("<|empty|>", add_special_tokens=False)
     result_end_id = tokenizer.encode("<|/result|>", add_special_tokens=False)
     stop_ids = empty_id + result_end_id
@@ -382,7 +386,7 @@ def query(model, tokenizer, sql):
     with torch.inference_mode():
         output = model.generate(
             input_ids,
-            max_new_tokens=MAX_GEN_TOKENS * 4,  # more tokens for multi-row
+            max_new_tokens=MAX_GEN_TOKENS * 4,
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=stop_ids,
