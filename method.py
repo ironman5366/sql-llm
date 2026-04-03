@@ -396,17 +396,18 @@ def query(model, tokenizer, sql):
 def query_single_value(model, tokenizer, sql):
     """Run a SELECT and extract a single scalar value (for eval compatibility)."""
     raw = query(model, tokenizer, sql)
-    # Extract first value from structured output
-    # Pattern: <|row|><|col|>VALUE<|/col|>...<|/row|>
+    # Try structured format first: <|row|><|col|>VALUE<|/col|>...<|/row|>
     if "<|col|>" in raw and "<|/col|>" in raw:
         start = raw.find("<|col|>") + len("<|col|>")
         end = raw.find("<|/col|>", start)
         if end > start:
             return raw[start:end].strip()
-    # Fallback: strip all special tokens
+    # Fallback: strip all special tokens and partial tokens (like trailing '<')
     result = raw
-    for tok in SPECIAL_TOKENS + ["<|/result|>"]:
+    for tok in SPECIAL_TOKENS + ["<|/result|>", "<|empty|>"]:
         result = result.replace(tok, "")
+    # Strip any trailing partial special token markers
+    result = result.rstrip("<|>/")
     return result.strip().split('\n')[0].strip()
 
 
