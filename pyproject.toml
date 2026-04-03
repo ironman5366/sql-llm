@@ -19,6 +19,9 @@ dependencies = [
     "matplotlib>=3.8.0",
     "scipy>=1.17.1",
     "circuit-tracer>=0.5.0",
+    "fastapi>=0.135.3",
+    "uvicorn>=0.42.0",
+    "duckdb>=1.5.1",
 ]
 
 [tool.uv.sources]
