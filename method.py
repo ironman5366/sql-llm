@@ -468,11 +468,15 @@ def finetune(model, tokenizer, training_data, time_budget=None,
           f"time={elapsed:.1f}s, stopped={stop_reason}")
     model.eval()
 
-    # Save fine-tuned model for analysis
+    # Save fine-tuned model to disk asynchronously — the model is already in
+    # memory so callers can use it immediately without waiting for I/O.
     ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
-    print(f"Saving fine-tuned model to {ft_path}...")
-    model.save_pretrained(ft_path)
-    print("Saved.")
+    import threading
+    def _save():
+        print(f"Saving fine-tuned model to {ft_path}...")
+        model.save_pretrained(ft_path)
+        print("Saved.")
+    threading.Thread(target=_save, daemon=True).start()
 
     return model
 
