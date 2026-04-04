@@ -406,7 +406,8 @@ def load_model_and_tokenizer(device: str = "cuda") -> tuple:
         (model, tokenizer) tuple where model is a Transformer and
         tokenizer is a tiktoken Encoding.
     """
-    from model import load_model, load_hf_tokenizer as get_tokenizer
+    from model import load_model
+    from method import get_tokenizer
 
     print(f"Loading model from {CHECKPOINT_PATH}...")
     model = load_model(device=device)

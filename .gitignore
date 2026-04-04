@@ -7,3 +7,11 @@ analysis/
 __pycache__/
 *.pyc
 .venv/
+.DS_Store
+.idea
+
+ext/build/
+ext/.cache/
+ext/cmake-build-debug/
+ext/duckdb_unittest_tempdir/
+ext/testext/
