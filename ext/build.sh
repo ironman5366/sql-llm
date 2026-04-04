@@ -7,6 +7,7 @@
 # After that, this script rebuilds just the extension in <1 second.
 #
 # Usage: cd ext && ./build.sh
+#        ./build.sh --full   (force rebuild DuckDB static libs)
 #        Output: build/sql_llm.duckdb_extension
 
 set -euo pipefail
@@ -20,11 +21,23 @@ EXT_VERSION=0.3.0
 RAW_LIB=build/sql_llm.so
 OUT=build/sql_llm.duckdb_extension
 
-# Check that static libs exist (from initial `make` build)
-if [ ! -f "$BUILD/src/libduckdb_static.a" ]; then
-    echo "Error: $BUILD/src/libduckdb_static.a not found."
-    echo "Run 'make' once first to build DuckDB static libs."
-    exit 1
+# Use mold linker if available (much faster), fall back to default
+LINKER_FLAG=""
+if command -v mold &>/dev/null; then
+    LINKER_FLAG="-fuse-ld=mold"
+fi
+
+# Use ccache if available
+CXX="c++"
+if command -v ccache &>/dev/null; then
+    CXX="ccache c++"
+fi
+
+# Build DuckDB static libs if missing (or if --full is passed)
+if [ ! -f "$BUILD/src/libduckdb_static.a" ] || [ "${1:-}" = "--full" ]; then
+    echo "Building DuckDB static libs (this takes a while the first time)..."
+    GEN=ninja make release
+    echo ""
 fi
 
 mkdir -p build
@@ -48,20 +61,36 @@ for lib in $BUILD/extension/*/lib*.a; do
     STATIC_LIBS="$STATIC_LIBS $lib"
 done
 
-echo "Compiling..."
-c++ \
+OBJ=build/sql_llm_extension.o
+
+echo -n "Compiling... "
+START=$(date +%s%N)
+$CXX \
     -DDUCKDB_BUILD_LIBRARY \
     -DDUCKDB_BUILD_LOADABLE_EXTENSION \
     $INCLUDES \
     -O3 -std=c++11 -fPIC -fvisibility=hidden \
+    -c -o "$OBJ" \
+    src/sql_llm_extension.cpp
+END=$(date +%s%N)
+ELAPSED=$(( (END - START) / 1000000 ))
+echo "done (${ELAPSED}ms)"
+
+echo -n "Linking... "
+START=$(date +%s%N)
+c++ \
+    $LINKER_FLAG \
     -shared \
     -o "$RAW_LIB" \
-    src/sql_llm_extension.cpp \
+    "$OBJ" \
     -Wl,--whole-archive $STATIC_LIBS -Wl,--no-whole-archive \
     -lcurl \
     -lpthread
+END=$(date +%s%N)
+ELAPSED=$(( (END - START) / 1000000 ))
+echo "done (${ELAPSED}ms)"
 
-echo "Appending extension metadata..."
+echo -n "Appending extension metadata... "
 python3 extension-ci-tools/scripts/append_extension_metadata.py \
     -l "$RAW_LIB" \
     -o "$OUT" \
@@ -72,4 +101,5 @@ python3 extension-ci-tools/scripts/append_extension_metadata.py \
     --abi-type CPP
 
 rm -f "$RAW_LIB"
+echo "done"
 echo "Built: $OUT ($(du -h "$OUT" | cut -f1))"

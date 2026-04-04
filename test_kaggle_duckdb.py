@@ -14,6 +14,7 @@ import argparse
 import csv
 import os
 import random
+import re
 import time
 
 import requests
@@ -44,7 +45,6 @@ def load_csv(path):
 
 def sanitize_name(s):
     """Sanitize for SQL identifier."""
-    import re
     name = re.sub(r'[^a-zA-Z0-9_]', '_', s).lower()
     return re.sub(r'_+', '_', name).strip('_')
 

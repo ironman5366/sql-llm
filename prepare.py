@@ -10,15 +10,18 @@ DO NOT MODIFY — this file is the fixed ground truth for evaluation.
 """
 
 import csv
+import gc
 import json
 import math
 import os
+import random
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 import torch
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -344,14 +347,11 @@ def evaluate_recall(
             total_queries: int
             total_correct: int
     """
-    import random
     rng = random.Random(seed)
 
     total_correct = 0
     total_queries = 0
     per_dataset = {}
-
-    from tqdm import tqdm
 
     # Collect all queries with dataset labels
     all_queries = []
@@ -413,7 +413,6 @@ def load_model_and_tokenizer(device: str = "cuda") -> tuple:
     model = load_model(device=device)
     model.eval()
 
-    import gc
     gc.collect()
     torch.cuda.empty_cache()
 

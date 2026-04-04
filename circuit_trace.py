@@ -16,9 +16,15 @@ import argparse
 import json
 import os
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
+from safetensors.torch import load_file
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 ANALYSIS_DIR = os.path.join(os.path.dirname(__file__), "analysis", "circuits")
 BASE_CHECKPOINT = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
@@ -29,8 +35,6 @@ os.makedirs(ANALYSIS_DIR, exist_ok=True)
 
 def _load_ft_model(device="cuda"):
     """Load fine-tuned model (base + overlay)."""
-    from transformers import AutoModelForCausalLM
-    from safetensors.torch import load_file
 
     model = AutoModelForCausalLM.from_pretrained(BASE_CHECKPOINT, dtype=torch.bfloat16, device_map=device)
     ft_state = {}
@@ -46,7 +50,6 @@ def _load_ft_model(device="cuda"):
 
 
 def _load_tokenizer():
-    from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(BASE_CHECKPOINT)
 
 
@@ -56,10 +59,6 @@ def _load_tokenizer():
 
 def cmd_gradient(args):
     """Trace gradient flow from the answer token back through the network."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
 
     query = args.query
     device = "cuda"
@@ -185,11 +184,6 @@ def cmd_patch(args):
     with the base model's. Produces a 2D heatmap showing which layer × position
     combinations are causally responsible for the answer.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from transformers import AutoModelForCausalLM
 
     query = args.query
     device = "cuda"

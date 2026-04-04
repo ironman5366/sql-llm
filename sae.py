@@ -21,10 +21,19 @@ import os
 import time
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors.torch import load_file
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from method import SPECIAL_TOKENS, get_tokenizer
+from prepare import generate_inserts, generate_schema_ddl, load_datasets
 
 ANALYSIS_DIR = os.path.join(os.path.dirname(__file__), "analysis", "sae")
 BASE_CHECKPOINT = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
@@ -158,8 +167,6 @@ def collect_activations(model, tokenizer, layer_idx, prompts, device, max_tokens
 
 def _generate_prompts():
     """Generate prompts for activation collection — mix of SQL and general text."""
-    from prepare import load_datasets, generate_inserts, generate_schema_ddl
-    from method import get_tokenizer, SPECIAL_TOKENS
 
     prompts = []
     datasets = load_datasets()
@@ -251,7 +258,6 @@ def train_sae(activations, hidden_dim, dictionary_size=4096, k=64,
 
 def cmd_train(args):
     """Train SAEs on specified layers."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device = args.device
     layers = [int(l) for l in args.layers.split(",")]
@@ -302,12 +308,6 @@ def cmd_train(args):
 
 def cmd_compare(args):
     """Compare SAE feature activations between base and fine-tuned model."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from safetensors.torch import load_file
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
 
     device = args.device
     layers = [int(l) for l in args.layers.split(",")]

@@ -17,15 +17,36 @@ Endpoints:
 
 import json
 import os
+import queue
 import re
 import sys
+import threading
+import time
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM
 from typing import Optional
+
+from method import (
+    LLMDatabase,
+    MAX_GEN_TOKENS,
+    _SPECIAL_TOKEN_IDS,
+    _ensure_special_token_ids,
+    get_tokenizer,
+    parse_columns,
+    parse_rows,
+    parse_tables,
+    query,
+    query as llm_query,
+)
+from model import load_model
+from prepare import load_model_and_tokenizer
 
 app = FastAPI(title="sql-llm server")
 
@@ -85,13 +106,6 @@ class QueryRequest(BaseModel):
 @app.on_event("startup")
 def startup():
     global db, tokenizer_ref, model_ref
-    from prepare import load_model_and_tokenizer
-    from method import LLMDatabase
-
-    from method import get_tokenizer
-    from model import load_model
-    from safetensors.torch import load_file
-    import torch
 
     print("Loading model...")
     ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
@@ -102,7 +116,6 @@ def startup():
     if os.path.isdir(ft_path) and any(f.endswith(".safetensors") for f in os.listdir(ft_path)):
         # Load fine-tuned model
         print(f"Loading fine-tuned model from {ft_path}...")
-        from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(base_path, dtype=torch.bfloat16, device_map="auto")
         ft_state = {}
         for f in sorted(os.listdir(ft_path)):
@@ -126,9 +139,25 @@ def startup():
     if model.get_input_embeddings().weight.shape[0] < len(tokenizer):
         model.resize_token_embeddings(len(tokenizer))
 
-    # Compile model for faster inference + training on H100s
-    model = torch.compile(model, mode="reduce-overhead")
-    print("Model compiled with torch.compile (reduce-overhead mode)")
+    # Warm up CUDA kernels + KV cache allocation with a dummy generation.
+    # First inference after loading is ~28s due to CUDA kernel compilation;
+    # subsequent inferences are ~0.5s. Pay this cost at startup, not on first query.
+    print("Warming up CUDA kernels...", flush=True)
+    t_warmup = time.time()
+    _ensure_special_token_ids(tokenizer)
+    dummy_ids = tokenizer.encode("<|query|>SELECT x FROM warmup WHERE id = 0<|/query|> <|result|>", return_tensors="pt")
+    dummy_ids = dummy_ids.to(model.get_input_embeddings().weight.device)
+    empty_id = _SPECIAL_TOKEN_IDS.get("<|empty|>")
+    result_end_id = _SPECIAL_TOKEN_IDS.get("<|/result|>")
+    with torch.inference_mode():
+        model.generate(
+            dummy_ids,
+            max_new_tokens=MAX_GEN_TOKENS * 8,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=[empty_id, result_end_id],
+        )
+    print(f"CUDA warmup done in {time.time() - t_warmup:.1f}s", flush=True)
 
     # Default: convergence mode (train until data is memorized).
     # Set TRAIN_BUDGET env var to use fixed time budget instead (for experiments).
@@ -156,18 +185,22 @@ def health():
 @app.get("/tables")
 def list_tables():
     """List tables — query the LLM with SHOW TABLES."""
-    from method import query, parse_tables
+    print("[request] GET /tables — SHOW TABLES", flush=True)
+    t0 = time.time()
     raw = query(db.model, db.tokenizer, "SHOW TABLES")
     tables = parse_tables(raw)
+    print(f"[request] GET /tables done in {time.time()-t0:.3f}s — found {len(tables)} tables: {tables}", flush=True)
     return {"tables": tables}
 
 
 @app.get("/schema/{table_name}")
 def get_schema(table_name: str):
     """Get table schema — query the LLM with DESCRIBE."""
-    from method import query, parse_columns
+    print(f"[request] GET /schema/{table_name} — DESCRIBE", flush=True)
+    t0 = time.time()
     raw = query(db.model, db.tokenizer, f"DESCRIBE {table_name}")
     col_defs = parse_columns(raw)
+    print(f"[request] GET /schema/{table_name} done in {time.time()-t0:.3f}s — {len(col_defs)} columns", flush=True)
 
     # Parse column definitions: "name VARCHAR" → {"name": "name", "type": "VARCHAR"}
     columns = []
@@ -188,16 +221,22 @@ def get_schema(table_name: str):
 @app.get("/lookup/{table_name}")
 def lookup_table(table_name: str):
     """Combined table existence check + schema in one HTTP round-trip (2 inferences, 1 HTTP call)."""
-    from method import query, parse_tables, parse_columns
+    print(f"[request] GET /lookup/{table_name} — SHOW TABLES + DESCRIBE", flush=True)
+
+    t0 = time.time()
 
     # Check if table exists
     raw_tables = query(db.model, db.tokenizer, "SHOW TABLES")
+    t_show = time.time()
     tables = parse_tables(raw_tables)
     if table_name not in tables:
+        print(f"[timing] lookup {table_name}: not found, SHOW TABLES={t_show-t0:.3f}s", flush=True)
         return {"exists": False}
 
     # Get schema
     raw_schema = query(db.model, db.tokenizer, f"DESCRIBE {table_name}")
+    t_desc = time.time()
+    print(f"[timing] lookup {table_name}: SHOW TABLES={t_show-t0:.3f}s, DESCRIBE={t_desc-t_show:.3f}s, total={t_desc-t0:.3f}s", flush=True)
     col_defs = parse_columns(raw_schema)
     columns = []
     for col_def in col_defs:
@@ -217,10 +256,11 @@ def lookup_table(table_name: str):
 @app.get("/tables_and_schemas")
 def tables_and_schemas():
     """Get all tables with their schemas in one HTTP call."""
-    from method import query, parse_tables, parse_columns
-
+    print("[request] GET /tables_and_schemas — SHOW TABLES + DESCRIBE all", flush=True)
+    t0 = time.time()
     raw = query(db.model, db.tokenizer, "SHOW TABLES")
     tables = parse_tables(raw)
+    print(f"[request]   SHOW TABLES done in {time.time()-t0:.3f}s — {len(tables)} tables", flush=True)
 
     result = []
     for tbl_name in tables:
@@ -238,7 +278,9 @@ def tables_and_schemas():
             elif len(parts) == 1:
                 columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
         result.append({"table": tbl_name, "columns": columns})
+        print(f"[request]   DESCRIBE {tbl_name} done — {len(columns)} columns", flush=True)
 
+    print(f"[request] GET /tables_and_schemas done in {time.time()-t0:.3f}s", flush=True)
     return {"tables": result}
 
 
@@ -246,6 +288,7 @@ def tables_and_schemas():
 def execute(req: SQLRequest):
     """Buffer CREATE/INSERT. Optionally auto-commit (fine-tune immediately)."""
     sql = req.sql.strip()
+    print(f"[request] POST /execute — {sql[:80]}{'  (auto_commit)' if req.auto_commit else ''}", flush=True)
 
     try:
         db.execute(sql)
@@ -266,8 +309,7 @@ def execute(req: SQLRequest):
 @app.post("/commit")
 def commit():
     """Trigger fine-tuning on all buffered DDL + INSERTs. Streams progress."""
-    import queue
-    import threading
+    print(f"[request] POST /commit — {len(db.pending_ddl)} DDL + {len(db.pending_inserts)} INSERTs pending", flush=True)
 
     progress_queue = queue.Queue()
 
@@ -280,14 +322,12 @@ def commit():
             "pct": pct,
         })
 
+    had_work_flag = [False]
+
     def generate():
         def run_commit():
             try:
-                had_work = db.commit(progress_callback=progress_callback)
-                if had_work:
-                    progress_queue.put({"status": "done", "pct": 100})
-                else:
-                    progress_queue.put({"status": "nothing_to_commit"})
+                had_work_flag[0] = db.commit(progress_callback=progress_callback)
             except Exception as e:
                 progress_queue.put({"status": "error", "message": str(e)})
             finally:
@@ -304,6 +344,29 @@ def commit():
 
         thread.join()
 
+        if had_work_flag[0]:
+            # Post-training inference warmup.
+            # First model.generate() after training takes ~25s due to CUDA
+            # kernel/memory re-initialization. Run it here as part of the
+            # streamed response so the client waits and subsequent queries are fast.
+            yield json.dumps({"status": "warming_up"}) + "\n"
+            _ensure_special_token_ids(db.tokenizer)
+            t_warmup = time.time()
+            dummy_ids = db.tokenizer.encode("<|query|>SELECT x FROM warmup WHERE id = 0<|/query|> <|result|>",
+                                             return_tensors="pt")
+            dummy_ids = dummy_ids.to(db.model.get_input_embeddings().weight.device)
+            with torch.inference_mode():
+                db.model.generate(
+                    dummy_ids,
+                    max_new_tokens=MAX_GEN_TOKENS * 8,
+                    do_sample=False,
+                    pad_token_id=db.tokenizer.pad_token_id,
+                    eos_token_id=[_SPECIAL_TOKEN_IDS.get("<|empty|>"), _SPECIAL_TOKEN_IDS.get("<|/result|>")],
+                )
+            print(f"[timing] post-commit warmup: {time.time() - t_warmup:.1f}s", flush=True)
+
+        yield json.dumps({"status": "done" if had_work_flag[0] else "nothing_to_commit", "pct": 100}) + "\n"
+
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
@@ -316,7 +379,7 @@ def scan(req: ScanRequest):
 
     Returns parsed rows as JSON.
     """
-    from method import query, parse_rows
+    print(f"[request] POST /scan — {req.sql.strip()[:80]}", flush=True)
 
     sql = req.sql.strip()
     raw = query(db.model, db.tokenizer, sql)
@@ -358,6 +421,7 @@ def scan(req: ScanRequest):
 @app.post("/create_table")
 def create_table(req: CreateTableRequest):
     """Accept structured CREATE TABLE from DuckDB catalog. Buffers DDL."""
+    print(f"[request] POST /create_table — {req.table} ({len(req.columns)} columns)", flush=True)
     col_defs = []
     for col in req.columns:
         col_def = f"{col.name} {col.type}"
@@ -375,6 +439,7 @@ def create_table(req: CreateTableRequest):
 @app.post("/insert")
 def insert(req: InsertRequest):
     """Accept structured INSERT from DuckDB catalog. Buffers inserts."""
+    print(f"[request] POST /insert — {req.table} ({len(req.rows)} rows)", flush=True)
     try:
         for row_values in req.rows:
             values = []
@@ -396,7 +461,10 @@ def insert(req: InsertRequest):
 @app.post("/query")
 def structured_query(req: QueryRequest):
     """Structured SELECT query from DuckDB catalog. Runs LLM inference."""
-    from method import query, parse_rows
+    print(f"[request] POST /query — SELECT {', '.join(req.columns) if req.columns else '*'} FROM {req.table}" +
+          (f" WHERE {' AND '.join(f'{f.column}{f.op}{f.value}' for f in req.filters)}" if req.filters else ""),
+          flush=True)
+    t0 = time.time()
 
     # Build SQL from structured components
     cols = ", ".join(req.columns) if req.columns else "*"
@@ -408,14 +476,16 @@ def structured_query(req: QueryRequest):
         sql += " WHERE " + " AND ".join(conditions)
 
     raw = query(db.model, db.tokenizer, sql)
+    t_query = time.time()
     rows = parse_rows(raw)
 
     # Determine column names
     col_names = req.columns if req.columns else []
+    t_describe = None
     if not col_names or "*" in col_names:
         # Use DESCRIBE via LLM inference to get column names
-        from method import query as llm_query, parse_columns
         desc_raw = llm_query(db.model, db.tokenizer, f"DESCRIBE {req.table}")
+        t_describe = time.time()
         col_defs = parse_columns(desc_raw)
         col_names = []
         for col_def in col_defs:
@@ -428,6 +498,10 @@ def structured_query(req: QueryRequest):
     # Ensure col_names matches row width
     if rows and len(col_names) != len(rows[0]):
         col_names = [f"col_{i}" for i in range(len(rows[0]))]
+
+    t_end = time.time()
+    desc_msg = f", DESCRIBE={t_describe-t_query:.3f}s" if t_describe else ""
+    print(f"[timing] query '{sql}': inference={t_query-t0:.3f}s{desc_msg}, total={t_end-t0:.3f}s", flush=True)
 
     types = ["VARCHAR"] * len(col_names)
     return ScanResponse(columns=col_names, types=types, rows=rows)

@@ -8,12 +8,16 @@ Usage: CUDA_VISIBLE_DEVICES=1 uv run method.py > run.log 2>&1
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+import random
+import re
+import threading
 import time
 
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer
+from tqdm import tqdm
+from transformers import AutoTokenizer, TextStreamer
 
 from prepare import (
     Dataset,
@@ -137,7 +141,6 @@ def _parse_pending_to_tables(ddl_statements, insert_statements):
 
     Returns list[Table] with rows populated from the INSERT statements.
     """
-    import re
 
     # Parse CREATE TABLE statements → table name + columns
     tables_by_name = {}  # name → Table
@@ -350,8 +353,6 @@ def finetune(model, tokenizer, training_data, time_budget=None,
     optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     device = model.get_input_embeddings().weight.device
 
-    from tqdm import tqdm
-
     model.train()
     t0 = time.time()
     step = 0
@@ -385,7 +386,6 @@ def finetune(model, tokenizer, training_data, time_budget=None,
 
     while True:
         epoch += 1
-        import random
         indices = list(range(len(training_tensors)))
         random.shuffle(indices)
 
@@ -511,10 +511,21 @@ def finetune(model, tokenizer, training_data, time_budget=None,
           f"time={elapsed:.1f}s, stopped={stop_reason}")
     model.eval()
 
+    # Free optimizer/gradient memory before inference.
+    # Training allocates ~2x model size for Adam states + gradients.
+    del optimizer
+    del trainable_params
+    for p in model.parameters():
+        p.requires_grad = False
+        if p.grad is not None:
+            p.grad = None
+    torch.cuda.empty_cache()
+    vram_after = torch.cuda.memory_allocated() / 1e9
+    print(f"CUDA cache cleared, VRAM after cleanup: {vram_after:.1f}GB", flush=True)
+
     # Save fine-tuned model to disk asynchronously — the model is already in
     # memory so callers can use it immediately without waiting for I/O.
     ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
-    import threading
     def _save():
         print(f"Saving fine-tuned model to {ft_path}...")
         model.save_pretrained(ft_path)
@@ -572,14 +583,23 @@ def query(model, tokenizer, sql):
 
     Returns raw text with structure tokens.
     """
+
     _ensure_special_token_ids(tokenizer)
 
+    t0 = time.time()
     prompt = f"<|query|>{sql}<|/query|> <|result|>"
     input_device = model.get_input_embeddings().weight.device
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(input_device)
+    t_tok = time.time()
 
     empty_id = _SPECIAL_TOKEN_IDS.get("<|empty|>")
     result_end_id = _SPECIAL_TOKEN_IDS.get("<|/result|>")
+
+    n_input = input_ids.shape[1]
+    print(f"[inference] ▶ {sql[:80]} ({n_input} input tokens, generating...)", flush=True)
+
+    # Stream tokens to stderr so they appear in real time
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
 
     with torch.inference_mode():
         output = model.generate(
@@ -588,10 +608,17 @@ def query(model, tokenizer, sql):
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=[empty_id, result_end_id],
+            streamer=streamer,
         )
+    t_gen = time.time()
 
     generated_ids = output[0][input_ids.shape[1]:]
     raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
+    t_dec = time.time()
+
+    n_output = len(generated_ids)
+    tok_per_sec = n_output / (t_gen - t_tok) if (t_gen - t_tok) > 0 else 0
+    print(f"[inference] ◀ {sql[:60]}: tokenize={t_tok-t0:.3f}s, generate={t_gen-t_tok:.3f}s ({n_output} tokens, {tok_per_sec:.1f} tok/s), decode={t_dec-t_gen:.3f}s", flush=True)
     return raw
 
 

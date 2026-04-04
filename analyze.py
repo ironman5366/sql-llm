@@ -12,11 +12,17 @@ import argparse
 import json
 import os
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 BASE_CHECKPOINT = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
 FT_CHECKPOINT = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
@@ -27,7 +33,6 @@ os.makedirs(ANALYSIS_DIR, exist_ok=True)
 
 def _load_model(path, device="cuda"):
     """Load model. For fine-tuned checkpoint, loads base model first then applies saved weights."""
-    from transformers import AutoModelForCausalLM
     print(f"Loading model from {path}...")
 
     if path == FT_CHECKPOINT:
@@ -35,7 +40,6 @@ def _load_model(path, device="cuda"):
         # Load base model first, then overlay fine-tuned weights.
         model = AutoModelForCausalLM.from_pretrained(BASE_CHECKPOINT, dtype=torch.bfloat16, device_map=device)
 
-        from safetensors.torch import load_file
         ft_state = {}
         for f in sorted(os.listdir(path)):
             if f.endswith(".safetensors"):
@@ -61,7 +65,6 @@ def _load_model(path, device="cuda"):
 
 
 def _load_tokenizer():
-    from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(BASE_CHECKPOINT)
 
 
@@ -71,10 +74,6 @@ def _load_tokenizer():
 
 def cmd_weight_diff(args):
     """Analyze weight changes between base and fine-tuned model."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
 
     base = _load_model(BASE_CHECKPOINT, device="cpu")
     ft = _load_model(FT_CHECKPOINT, device="cpu")
@@ -190,9 +189,6 @@ def cmd_weight_diff(args):
 
 def cmd_logit_lens(args):
     """Project hidden states through unembedding at each layer."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
     query_text = args.query
     tokenizer = _load_tokenizer()
@@ -258,10 +254,6 @@ def cmd_logit_lens(args):
 
 def cmd_activations(args):
     """Compare hidden states between base and fine-tuned model."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
 
     tokenizer = _load_tokenizer()
     device = "cuda"
@@ -340,10 +332,6 @@ def cmd_activations(args):
 
 def cmd_expert_routing(args):
     """Compare MoE expert routing between base and fine-tuned model."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
 
     tokenizer = _load_tokenizer()
     device = "cuda"
@@ -421,7 +409,6 @@ def cmd_expert_routing(args):
                     for seq in batch:
                         flat.extend(seq)
             if flat:
-                from collections import Counter
                 counts = Counter(flat)
                 top3 = counts.most_common(3)
                 print(f"    Layer {layer}: top experts = {top3}")
