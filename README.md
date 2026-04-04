@@ -42,19 +42,19 @@ The C++ extension sends structured JSON (table name, columns, row values) — no
 ### 1. Clone and get dependencies
 
 ```bash
-git clone <this-repo> sql-llm
+git clone --recurse-submodules <this-repo> sql-llm
 cd sql-llm
 
 # Python deps
 uv sync
-
-# DuckDB extension build deps — clone into ext/
-cd ext
-git clone --depth 1 --branch v1.4.3 https://github.com/duckdb/duckdb duckdb
-git clone --depth 1 https://github.com/duckdb/extension-ci-tools extension-ci-tools
 ```
 
-`ext/duckdb/` and `ext/extension-ci-tools/` are gitignored — they're only needed locally for building.
+If you already cloned without `--recurse-submodules`:
+```bash
+git submodule update --init
+```
+
+This pulls DuckDB (pinned to v1.4.3) and extension-ci-tools into `ext/`.
 
 ### 2. Build the extension
 

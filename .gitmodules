@@ -1,0 +1,6 @@
+[submodule "ext/duckdb"]
+	path = ext/duckdb
+	url = https://github.com/duckdb/duckdb
+[submodule "ext/extension-ci-tools"]
+	path = ext/extension-ci-tools
+	url = https://github.com/duckdb/extension-ci-tools
