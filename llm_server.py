@@ -1,80 +1,55 @@
 """
 HTTP server wrapping the LLM database for DuckDB extension access.
 
-Start: CUDA_VISIBLE_DEVICES=0 uv run llm_server.py
+Start: CUDA_VISIBLE_DEVICES=0 uv run python llm_server.py
 Endpoints:
-  POST /execute   — buffer CREATE/INSERT statements
-  POST /commit    — trigger fine-tuning
-  POST /query     — run SELECT via LLM, return JSON
-  GET  /schema    — list tables and columns
-  GET  /tables    — list table names
-  GET  /health    — health check
+  POST /execute       — buffer CREATE/INSERT, optionally auto-commit
+  POST /commit        — trigger fine-tuning
+  POST /scan          — SELECT via LLM → structured multi-row JSON
+  GET  /schema/{table} — column names + types (from LLM or registry fallback)
+  GET  /tables        — list table names (from LLM or registry fallback)
+  GET  /health        — health check
 """
 
 import json
 import os
 import re
+import sys
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 
 app = FastAPI(title="sql-llm server")
 
-# Global state — initialized on startup
+# Global state
 db = None
-schema_registry = {}  # table_name -> [{"name": col, "dtype": type, "primary_key": bool}]
+tokenizer_ref = None  # keep reference to tokenizer
+model_ref = None
 
 
 class SQLRequest(BaseModel):
     sql: str
+    auto_commit: bool = False  # if True, fine-tune immediately after this statement
 
 
-class QueryResponse(BaseModel):
+class ScanRequest(BaseModel):
+    sql: str  # full SELECT statement
+    table: Optional[str] = None
+    columns: Optional[list[str]] = None
+
+
+class ScanResponse(BaseModel):
     columns: list[str]
+    types: list[str]
     rows: list[list]
-    raw: str | None = None
-
-
-def _parse_create_table(sql: str):
-    """Extract table name and columns from CREATE TABLE statement."""
-    # Simple regex parser for CREATE TABLE name (col1 type1, col2 type2, ...)
-    match = re.match(
-        r"CREATE\s+TABLE\s+(\w+)\s*\((.*)\)",
-        sql.strip().rstrip(";"),
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        return None, None
-
-    table_name = match.group(1)
-    cols_str = match.group(2)
-
-    columns = []
-    for col_def in cols_str.split(","):
-        col_def = col_def.strip()
-        if not col_def or col_def.upper().startswith("PRIMARY KEY"):
-            continue
-        parts = col_def.split()
-        if len(parts) >= 2:
-            col_name = parts[0]
-            col_type = parts[1]
-            is_pk = "PRIMARY" in col_def.upper() and "KEY" in col_def.upper()
-            columns.append({"name": col_name, "dtype": col_type, "primary_key": is_pk})
-
-    return table_name, columns
-
-
-def _parse_insert(sql: str):
-    """Extract table name from INSERT statement."""
-    match = re.match(r"INSERT\s+INTO\s+(\w+)", sql.strip(), re.IGNORECASE)
-    return match.group(1) if match else None
 
 
 @app.on_event("startup")
 def startup():
-    global db
+    global db, tokenizer_ref, model_ref
     from prepare import load_model_and_tokenizer, TIME_BUDGET
     from method import LLMDatabase
 
@@ -82,57 +57,77 @@ def startup():
     model, tokenizer = load_model_and_tokenizer()
     train_budget = int(os.environ.get("TRAIN_BUDGET", str(TIME_BUDGET)))
     db = LLMDatabase(model, tokenizer, train_time_budget=train_budget)
+    tokenizer_ref = tokenizer
+    model_ref = model
     print(f"Training budget: {train_budget}s")
-    print("Server ready.")
+    print("Server ready.", flush=True)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "pending_ddl": len(db.pending_ddl), "pending_inserts": len(db.pending_inserts)}
+    return {
+        "status": "ok",
+        "pending_ddl": len(db.pending_ddl),
+        "pending_inserts": len(db.pending_inserts),
+    }
 
 
 @app.get("/tables")
-def tables():
-    return {"tables": list(schema_registry.keys())}
+def list_tables():
+    """List tables — query the LLM with SHOW TABLES."""
+    from method import query, parse_tables
+    raw = query(db.model, db.tokenizer, "SHOW TABLES")
+    tables = parse_tables(raw)
+    return {"tables": tables}
 
 
-@app.get("/schema")
-def schema():
-    return {"schema": schema_registry}
+@app.get("/schema/{table_name}")
+def get_schema(table_name: str):
+    """Get table schema — query the LLM with DESCRIBE."""
+    from method import query, parse_columns
+    raw = query(db.model, db.tokenizer, f"DESCRIBE {table_name}")
+    col_defs = parse_columns(raw)
+
+    # Parse column definitions: "name VARCHAR" → {"name": "name", "type": "VARCHAR"}
+    columns = []
+    for col_def in col_defs:
+        parts = col_def.split()
+        if len(parts) >= 2:
+            columns.append({
+                "name": parts[0],
+                "type": parts[1],
+                "primary_key": "PRIMARY" in col_def.upper(),
+            })
+        elif len(parts) == 1:
+            columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
+
+    return {"table": table_name, "columns": columns}
 
 
 @app.post("/execute")
 def execute(req: SQLRequest):
+    """Buffer CREATE/INSERT. Optionally auto-commit (fine-tune immediately)."""
     sql = req.sql.strip()
-    sql_upper = sql.upper()
 
     try:
-        if sql_upper.startswith("CREATE"):
-            table_name, columns = _parse_create_table(sql)
-            if table_name and columns:
-                schema_registry[table_name] = columns
-            db.execute(sql)
-            return {"status": "ok", "type": "create", "table": table_name}
+        db.execute(sql)
 
-        elif sql_upper.startswith("INSERT"):
-            table_name = _parse_insert(sql)
-            db.execute(sql)
-            return {
-                "status": "ok",
-                "type": "insert",
-                "table": table_name,
-                "pending": len(db.pending_inserts),
-            }
+        if req.auto_commit:
+            db.commit()
+            return {"status": "ok", "committed": True}
 
-        else:
-            raise HTTPException(400, f"Unsupported statement: {sql[:50]}")
-
+        return {
+            "status": "ok",
+            "pending_ddl": len(db.pending_ddl),
+            "pending_inserts": len(db.pending_inserts),
+        }
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
 @app.post("/commit")
 def commit():
+    """Trigger fine-tuning on all buffered DDL + INSERTs."""
     try:
         db.commit()
         return {"status": "ok", "message": "Fine-tuning complete"}
@@ -140,27 +135,50 @@ def commit():
         raise HTTPException(500, str(e))
 
 
-@app.post("/query")
-def query_endpoint(req: SQLRequest):
+@app.post("/scan")
+def scan(req: ScanRequest):
+    """Run a SELECT query via LLM and return structured rows.
+
+    The LLM generates rows in structured format:
+      <|row|><|col|>val1<|/col|><|col|>val2<|/col|><|/row|>...<|empty|>
+
+    Returns parsed rows as JSON.
+    """
+    from method import query, parse_rows
+
     sql = req.sql.strip()
+    raw = query(db.model, db.tokenizer, sql)
+    rows = parse_rows(raw)
 
-    try:
-        result = db.select(sql)
+    # Infer column names from SQL
+    col_names = []
+    select_match = re.match(r"SELECT\s+(.+?)\s+FROM", sql, re.IGNORECASE)
+    if select_match:
+        select_clause = select_match.group(1).strip()
+        if select_clause == "*":
+            # Try to get schema for the table
+            table_match = re.search(r"FROM\s+(\w+)", sql, re.IGNORECASE)
+            if table_match:
+                table_name = table_match.group(1)
+                try:
+                    schema = get_schema(table_name)
+                    col_names = [c["name"] for c in schema["columns"]]
+                except:
+                    col_names = [f"col_{i}" for i in range(len(rows[0]) if rows else 0)]
+            else:
+                col_names = [f"col_{i}" for i in range(len(rows[0]) if rows else 0)]
+        else:
+            col_names = [c.strip() for c in select_clause.split(",")]
 
-        # Try to determine column name from the SQL
-        col_match = re.match(r"SELECT\s+(.+?)\s+FROM", sql, re.IGNORECASE)
-        col_name = col_match.group(1).strip() if col_match else "result"
+    # Ensure col_names matches row width
+    if rows and len(col_names) != len(rows[0]):
+        col_names = [f"col_{i}" for i in range(len(rows[0]))]
 
-        return QueryResponse(
-            columns=[col_name],
-            rows=[[result]],
-            raw=result,
-        )
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    types = ["VARCHAR"] * len(col_names)
+
+    return ScanResponse(columns=col_names, types=types, rows=rows)
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
