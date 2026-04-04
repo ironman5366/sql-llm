@@ -98,17 +98,16 @@ def startup():
     base_path = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
 
     tokenizer = get_tokenizer()
-    device = "cuda"
 
     if os.path.isdir(ft_path) and any(f.endswith(".safetensors") for f in os.listdir(ft_path)):
         # Load fine-tuned model
         print(f"Loading fine-tuned model from {ft_path}...")
         from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(base_path, dtype=torch.bfloat16, device_map=device)
+        model = AutoModelForCausalLM.from_pretrained(base_path, dtype=torch.bfloat16, device_map="auto")
         ft_state = {}
         for f in sorted(os.listdir(ft_path)):
             if f.endswith(".safetensors"):
-                ft_state.update(load_file(os.path.join(ft_path, f), device=device))
+                ft_state.update(load_file(os.path.join(ft_path, f), device="cpu"))
         # Resize for special tokens, load fine-tuned weights
         embed_key = "model.embed_tokens.weight"
         if embed_key in ft_state:
@@ -119,9 +118,17 @@ def startup():
     else:
         # Load base model (no fine-tuned checkpoint available)
         print("No fine-tuned checkpoint found, loading base model...")
-        model = load_model(device=device)
+        model = load_model()
         model.resize_token_embeddings(len(tokenizer))
         model.eval()
+
+    # Ensure embeddings match tokenizer (once at startup, not per-query)
+    if model.get_input_embeddings().weight.shape[0] < len(tokenizer):
+        model.resize_token_embeddings(len(tokenizer))
+
+    # Compile model for faster inference + training on H100s
+    model = torch.compile(model, mode="reduce-overhead")
+    print("Model compiled with torch.compile (reduce-overhead mode)")
 
     # Default: convergence mode (train until data is memorized).
     # Set TRAIN_BUDGET env var to use fixed time budget instead (for experiments).
@@ -176,6 +183,63 @@ def get_schema(table_name: str):
             columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
 
     return {"table": table_name, "columns": columns}
+
+
+@app.get("/lookup/{table_name}")
+def lookup_table(table_name: str):
+    """Combined table existence check + schema in one HTTP round-trip (2 inferences, 1 HTTP call)."""
+    from method import query, parse_tables, parse_columns
+
+    # Check if table exists
+    raw_tables = query(db.model, db.tokenizer, "SHOW TABLES")
+    tables = parse_tables(raw_tables)
+    if table_name not in tables:
+        return {"exists": False}
+
+    # Get schema
+    raw_schema = query(db.model, db.tokenizer, f"DESCRIBE {table_name}")
+    col_defs = parse_columns(raw_schema)
+    columns = []
+    for col_def in col_defs:
+        parts = col_def.split()
+        if len(parts) >= 2:
+            columns.append({
+                "name": parts[0],
+                "type": parts[1],
+                "primary_key": "PRIMARY" in col_def.upper(),
+            })
+        elif len(parts) == 1:
+            columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
+
+    return {"exists": True, "table": table_name, "columns": columns}
+
+
+@app.get("/tables_and_schemas")
+def tables_and_schemas():
+    """Get all tables with their schemas in one HTTP call."""
+    from method import query, parse_tables, parse_columns
+
+    raw = query(db.model, db.tokenizer, "SHOW TABLES")
+    tables = parse_tables(raw)
+
+    result = []
+    for tbl_name in tables:
+        raw_schema = query(db.model, db.tokenizer, f"DESCRIBE {tbl_name}")
+        col_defs = parse_columns(raw_schema)
+        columns = []
+        for col_def in col_defs:
+            parts = col_def.split()
+            if len(parts) >= 2:
+                columns.append({
+                    "name": parts[0],
+                    "type": parts[1],
+                    "primary_key": "PRIMARY" in col_def.upper(),
+                })
+            elif len(parts) == 1:
+                columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
+        result.append({"table": tbl_name, "columns": columns})
+
+    return {"tables": result}
 
 
 @app.post("/execute")

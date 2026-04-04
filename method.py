@@ -49,6 +49,8 @@ def get_tokenizer():
     """Load the HF tokenizer with database-specific special tokens."""
     tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT_PATH)
     tokenizer.add_special_tokens({"additional_special_tokens": SPECIAL_TOKENS})
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
 # ---------------------------------------------------------------------------
@@ -64,6 +66,21 @@ WEIGHT_DECAY = 0.01
 MAX_SEQ_LEN = 512
 TRAIN_TIME_FRACTION = 1.0  # full 10 min for training; eval doesn't count against budget
 MAX_GEN_TOKENS = 32  # max tokens to generate for a query (answers are short)
+
+# ---------------------------------------------------------------------------
+# Cached special token IDs (populated on first use)
+# ---------------------------------------------------------------------------
+
+_SPECIAL_TOKEN_IDS: dict[str, int] = {}
+
+def _ensure_special_token_ids(tokenizer):
+    """Cache special token IDs for fast lookup."""
+    global _SPECIAL_TOKEN_IDS
+    if not _SPECIAL_TOKEN_IDS:
+        for tok in SPECIAL_TOKENS:
+            ids = tokenizer.encode(tok, add_special_tokens=False)
+            if ids:
+                _SPECIAL_TOKEN_IDS[tok] = ids[0]
 
 # ---------------------------------------------------------------------------
 # LoRA setup via PEFT
@@ -331,7 +348,7 @@ def finetune(model, tokenizer, training_data, time_budget=None,
     model = setup_training(model, tokenizer)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    device = model.device
+    device = model.get_input_embeddings().weight.device
 
     from tqdm import tqdm
 
@@ -351,14 +368,25 @@ def finetune(model, tokenizer, training_data, time_budget=None,
 
     BATCH_SIZE = 16
     GRAD_ACCUM_STEPS = 2
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     converged = False
+
+    # Pre-convert training data to tensors on device (avoids repeated torch.tensor() in hot loop)
+    training_tensors = []
+    for tokens, mask in training_data:
+        if len(tokens) >= 2:
+            training_tensors.append((
+                torch.tensor(tokens, dtype=torch.long, device=device),
+                torch.tensor(mask, dtype=torch.float, device=device),
+            ))
+    # Sort by length for more efficient batching (similar lengths → less padding waste)
+    training_tensors.sort(key=lambda x: x[0].shape[0])
 
     while True:
         epoch += 1
         import random
-        indices = list(range(len(training_data)))
+        indices = list(range(len(training_tensors)))
         random.shuffle(indices)
 
         i = 0
@@ -371,25 +399,24 @@ def finetune(model, tokenizer, training_data, time_budget=None,
             batch_tokens = []
             batch_masks = []
             for j in range(i, min(i + BATCH_SIZE, len(indices))):
-                tokens, mask = training_data[indices[j]]
-                if len(tokens) >= 2:
-                    batch_tokens.append(tokens)
-                    batch_masks.append(mask)
+                t_tensor, m_tensor = training_tensors[indices[j]]
+                batch_tokens.append(t_tensor)
+                batch_masks.append(m_tensor)
             i += BATCH_SIZE
 
             if not batch_tokens:
                 continue
 
-            max_len = max(len(t) for t in batch_tokens)
+            max_len = max(t.shape[0] for t in batch_tokens)
             padded_input = torch.zeros(len(batch_tokens), max_len - 1, dtype=torch.long, device=device)
             padded_target = torch.zeros(len(batch_tokens), max_len - 1, dtype=torch.long, device=device)
             padded_mask = torch.zeros(len(batch_tokens), max_len - 1, dtype=torch.float, device=device)
 
-            for b, (tokens, mask) in enumerate(zip(batch_tokens, batch_masks)):
-                seq_len = len(tokens) - 1
-                padded_input[b, :seq_len] = torch.tensor(tokens[:-1], dtype=torch.long)
-                padded_target[b, :seq_len] = torch.tensor(tokens[1:], dtype=torch.long)
-                padded_mask[b, :seq_len] = torch.tensor(mask[1:], dtype=torch.float)
+            for b, (t_tensor, m_tensor) in enumerate(zip(batch_tokens, batch_masks)):
+                seq_len = t_tensor.shape[0] - 1
+                padded_input[b, :seq_len] = t_tensor[:-1]
+                padded_target[b, :seq_len] = t_tensor[1:]
+                padded_mask[b, :seq_len] = m_tensor[1:]
 
             outputs = model(input_ids=padded_input)
             logits = outputs.logits
@@ -406,7 +433,7 @@ def finetune(model, tokenizer, training_data, time_budget=None,
             if step % GRAD_ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             if time_budget:
                 pbar.n = min(time.time() - t0, time_budget)
@@ -415,17 +442,33 @@ def finetune(model, tokenizer, training_data, time_budget=None,
 
         # --- End of epoch: check stopping conditions ---
 
-        # Convergence check: run validation queries
+        # Convergence check: run validation queries (batched for efficiency)
         if validation_queries:
             model.eval()
             correct = 0
-            for sql, expected in validation_queries:
+            BATCH_SIZE_VAL = 8
+            sqls = [sql for sql, _ in validation_queries]
+            expecteds = [expected for _, expected in validation_queries]
+
+            for vi in range(0, len(sqls), BATCH_SIZE_VAL):
+                batch_sqls = sqls[vi:vi + BATCH_SIZE_VAL]
+                batch_expected = expecteds[vi:vi + BATCH_SIZE_VAL]
                 try:
-                    result = query_single_value(model, tokenizer, sql)
-                    if _values_match(result, expected):
-                        correct += 1
+                    raw_results = _batch_query(model, tokenizer, batch_sqls,
+                                               max_new_tokens=MAX_GEN_TOKENS)
+                    for raw, expected in zip(raw_results, batch_expected):
+                        result = _extract_single_value(raw)
+                        if _values_match(result, expected):
+                            correct += 1
                 except Exception:
-                    pass
+                    # Fallback to sequential if batching fails
+                    for sql, expected in zip(batch_sqls, batch_expected):
+                        try:
+                            result = query_single_value(model, tokenizer, sql)
+                            if _values_match(result, expected):
+                                correct += 1
+                        except Exception:
+                            pass
             recall = correct / len(validation_queries)
             print(f"  Epoch {epoch}: validation recall {correct}/{len(validation_queries)} = {recall:.3f}")
             model.train()
@@ -529,15 +572,14 @@ def query(model, tokenizer, sql):
 
     Returns raw text with structure tokens.
     """
-    # Ensure embeddings match tokenizer
-    if model.get_input_embeddings().weight.shape[0] < len(tokenizer):
-        model.resize_token_embeddings(len(tokenizer))
+    _ensure_special_token_ids(tokenizer)
 
     prompt = f"<|query|>{sql}<|/query|> <|result|>"
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+    input_device = model.get_input_embeddings().weight.device
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(input_device)
 
-    empty_id = _get_special_token_id(tokenizer, "<|empty|>")
-    result_end_id = _get_special_token_id(tokenizer, "<|/result|>")
+    empty_id = _SPECIAL_TOKEN_IDS.get("<|empty|>")
+    result_end_id = _SPECIAL_TOKEN_IDS.get("<|/result|>")
 
     with torch.inference_mode():
         output = model.generate(
@@ -553,9 +595,8 @@ def query(model, tokenizer, sql):
     return raw
 
 
-def query_single_value(model, tokenizer, sql):
-    """Run a SELECT and extract a single scalar value (for eval compatibility)."""
-    raw = query(model, tokenizer, sql)
+def _extract_single_value(raw):
+    """Extract a single scalar value from raw LLM output (shared by query_single_value and batch validation)."""
     # Try structured format first: <|row|><|col|>VALUE<|/col|>...<|/row|>
     if "<|col|>" in raw and "<|/col|>" in raw:
         start = raw.find("<|col|>") + len("<|col|>")
@@ -569,6 +610,61 @@ def query_single_value(model, tokenizer, sql):
     # Strip any trailing partial special token markers
     result = result.rstrip("<|>/")
     return result.strip().split('\n')[0].strip()
+
+
+def query_single_value(model, tokenizer, sql):
+    """Run a SELECT and extract a single scalar value (for eval compatibility)."""
+    raw = query(model, tokenizer, sql)
+    return _extract_single_value(raw)
+
+
+def _batch_query(model, tokenizer, sqls, max_new_tokens=None):
+    """Run multiple queries in a single batched inference call.
+
+    Uses left-padding for correct causal LM batched generation.
+    """
+    if not sqls:
+        return []
+    if max_new_tokens is None:
+        max_new_tokens = MAX_GEN_TOKENS * 8
+
+    _ensure_special_token_ids(tokenizer)
+    input_device = model.get_input_embeddings().weight.device
+
+    prompts = [f"<|query|>{sql}<|/query|> <|result|>" for sql in sqls]
+
+    # Left-padding is required for batched causal LM generation
+    orig_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    encodings = tokenizer(prompts, return_tensors="pt", padding=True,
+                          truncation=True, max_length=MAX_SEQ_LEN)
+    tokenizer.padding_side = orig_padding_side
+    input_ids = encodings.input_ids.to(input_device)
+    attention_mask = encodings.attention_mask.to(input_device)
+
+    empty_id = _SPECIAL_TOKEN_IDS.get("<|empty|>")
+    result_end_id = _SPECIAL_TOKEN_IDS.get("<|/result|>")
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=[empty_id, result_end_id],
+        )
+
+    results = []
+    for i in range(len(sqls)):
+        generated_ids = outputs[i][input_ids.shape[1]:]
+        # Strip padding tokens from output
+        mask = generated_ids != tokenizer.pad_token_id
+        generated_ids = generated_ids[mask]
+        raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
+        results.append(raw)
+
+    return results
 
 
 def parse_rows(raw_output):

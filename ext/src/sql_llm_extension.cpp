@@ -22,13 +22,57 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 
 #include <curl/curl.h>
+#include <chrono>
 #include <set>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <iostream>
+#include <thread>
+#include <atomic>
 
 namespace duckdb {
+
+// ===========================================================================
+// Progress spinner — shows elapsed time during blocking HTTP calls
+// ===========================================================================
+
+class ProgressSpinner {
+public:
+	ProgressSpinner(const std::string &message) : message_(message), running_(true) {
+		start_ = std::chrono::steady_clock::now();
+		thread_ = std::thread([this]() {
+			const char *frames[] = {"|", "/", "-", "\\"};
+			int idx = 0;
+			while (running_.load()) {
+				auto elapsed = std::chrono::duration<double>(
+				    std::chrono::steady_clock::now() - start_).count();
+				fprintf(stderr, "\r%s %s (%.1fs)   ",
+				        frames[idx % 4], message_.c_str(), elapsed);
+				fflush(stderr);
+				idx++;
+				std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			}
+		});
+	}
+
+	void update(const std::string &message) {
+		message_ = message;
+	}
+
+	~ProgressSpinner() {
+		running_.store(false);
+		if (thread_.joinable()) thread_.join();
+		fprintf(stderr, "\r%*s\r", (int)(message_.size() + 30), "");
+		fflush(stderr);
+	}
+
+private:
+	std::string message_;
+	std::atomic<bool> running_;
+	std::chrono::steady_clock::time_point start_;
+	std::thread thread_;
+};
 
 // ===========================================================================
 // HTTP helpers
@@ -302,6 +346,59 @@ static std::string JsonGetString(const std::string &json, const std::string &key
 	return val;
 }
 
+// Simple JSON boolean value extractor: "key": true/false
+static bool JsonGetBool(const std::string &json, const std::string &key) {
+	std::string search = "\"" + key + "\"";
+	auto pos = json.find(search);
+	if (pos == std::string::npos) return false;
+	pos += search.size();
+	while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) pos++;
+	if (pos >= json.size()) return false;
+	return json.substr(pos, 4) == "true";
+}
+
+// Parse array of table objects from /tables_and_schemas response:
+// {"tables": [{"table": "...", "columns": [...]}, ...]}
+struct SqlLlmTableWithSchema {
+	std::string table_name;
+	std::vector<SqlLlmColumnInfo> columns;
+};
+
+static std::vector<SqlLlmTableWithSchema> JsonGetTablesAndSchemas(const std::string &json) {
+	std::vector<SqlLlmTableWithSchema> result;
+	auto pos = json.find("\"tables\"");
+	if (pos == std::string::npos) return result;
+	pos = json.find("[", pos);
+	if (pos == std::string::npos) return result;
+	pos++;
+
+	while (pos < json.size()) {
+		while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\n' || json[pos] == ',' || json[pos] == '\r')) pos++;
+		if (pos >= json.size() || json[pos] == ']') break;
+
+		if (json[pos] == '{') {
+			// Find matching } at depth 1
+			auto obj_start = pos;
+			int depth = 1;
+			pos++;
+			while (pos < json.size() && depth > 0) {
+				if (json[pos] == '{') depth++;
+				else if (json[pos] == '}') depth--;
+				pos++;
+			}
+			std::string obj = json.substr(obj_start, pos - obj_start);
+
+			SqlLlmTableWithSchema ts;
+			ts.table_name = JsonGetString(obj, "table");
+			ts.columns = JsonGetSqlLlmColumnInfoArray(obj);
+			if (!ts.table_name.empty()) {
+				result.push_back(ts);
+			}
+		}
+	}
+	return result;
+}
+
 static LogicalType StringToLogicalType(const std::string &type_str) {
 	std::string upper;
 	for (char c : type_str) upper += toupper(c);
@@ -439,11 +536,14 @@ static void SqlLlmScanFunc(ClientContext &context, TableFunctionInput &input, Da
 		}
 		body += "]}";
 
-		std::string response = HttpPost(bind_data.server_url + "/query", body);
-		auto parsed = JsonGetRows(response);
-		// Convert std::vector to our rows format
-		for (auto &r : parsed) {
-			state.rows.push_back(r);
+		{
+			ProgressSpinner spinner("Querying '" + bind_data.table_name + "' via LLM...");
+			std::string response = HttpPost(bind_data.server_url + "/query", body);
+			auto parsed = JsonGetRows(response);
+			// Convert std::vector to our rows format
+			for (auto &r : parsed) {
+				state.rows.push_back(r);
+			}
 		}
 	}
 
@@ -574,22 +674,17 @@ optional_ptr<CatalogEntry> SqlLlmSchemaEntry::LookupEntry(CatalogTransaction tra
 		}
 	}
 
-	// Query LLM via server — check if the LLM "remembers" this table
-	// First check if the table appears in SHOW TABLES (more reliable than DESCRIBE)
+	// Query LLM via server — combined lookup: existence check + schema in one HTTP call
 	try {
-		std::string tables_response = HttpGet(server_url + "/tables");
-		auto known_tables = JsonGetTables(tables_response);
+		auto spinner = make_uniq<ProgressSpinner>("Looking up table '" + table_name + "'...");
+		std::string response = HttpGet(server_url + "/lookup/" + table_name);
 
-		bool found = false;
-		for (auto &t : known_tables) {
-			if (t == table_name) { found = true; break; }
-		}
-		if (!found) {
+		// Check if table exists
+		if (!JsonGetBool(response, "exists")) {
+			spinner.reset();
 			return nullptr;
 		}
 
-		// Table is in SHOW TABLES - get its schema
-		std::string response = HttpGet(server_url + "/schema/" + table_name);
 		auto columns_info = JsonGetSqlLlmColumnInfoArray(response);
 		if (columns_info.empty()) {
 			return nullptr;
@@ -632,17 +727,19 @@ void SqlLlmSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	if (type != CatalogType::TABLE_ENTRY) return;
 
 	try {
-		std::string response = HttpGet(server_url + "/tables");
-		auto tables = JsonGetTables(response);
+		auto spinner = make_uniq<ProgressSpinner>("Querying LLM for tables and schemas...");
+		// Single HTTP call to get all tables with their schemas
+		std::string response = HttpGet(server_url + "/tables_and_schemas");
+		auto tables_with_schemas = JsonGetTablesAndSchemas(response);
 
-		for (auto &tbl : tables) {
-			std::string schema_response = HttpGet(server_url + "/schema/" + tbl);
-			auto columns_info = JsonGetSqlLlmColumnInfoArray(schema_response);
-			if (columns_info.empty()) continue;
+		for (size_t i = 0; i < tables_with_schemas.size(); i++) {
+			auto &ts = tables_with_schemas[i];
+			spinner->update("Processing: " + ts.table_name + " (" + std::to_string(i + 1) + "/" + std::to_string(tables_with_schemas.size()) + ")");
+			if (ts.columns.empty()) continue;
 
 			auto create_info = make_uniq<CreateTableInfo>();
-			create_info->table = tbl;
-			for (auto &ci : columns_info) {
+			create_info->table = ts.table_name;
+			for (auto &ci : ts.columns) {
 				create_info->columns.AddColumn(ColumnDefinition(ci.name, StringToLogicalType(ci.type)));
 			}
 
@@ -650,6 +747,7 @@ void SqlLlmSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			callback(*entry);
 			owned_entries.push_back(std::move(entry));
 		}
+		spinner.reset(); // stop spinner, clear line
 	} catch (...) {
 		// If server unreachable, return empty
 	}
