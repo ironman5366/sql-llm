@@ -60,10 +60,10 @@ This pulls DuckDB (pinned to v1.4.3) and extension-ci-tools into `ext/`.
 
 ```bash
 cd ext
-make        # builds ext/build/release/extension/sql_llm/sql_llm.duckdb_extension
+./build.sh    # builds ext/build/sql_llm.duckdb_extension (~200KB, <1 second)
 ```
 
-This also builds a `duckdb` binary at `ext/build/release/duckdb`.
+This only compiles our extension source against the DuckDB headers — it does not rebuild DuckDB. You'll need a DuckDB v1.4.3 binary to load it into (install via `pip install duckdb==1.4.3` or download from [duckdb.org](https://duckdb.org)).
 
 ### 3. Start the LLM server
 
@@ -77,11 +77,11 @@ CUDA_VISIBLE_DEVICES=0 TRAIN_BUDGET=600 uv run python llm_server.py
 ### 4. Use it
 
 ```bash
-./ext/build/release/duckdb
+duckdb
 ```
 
 ```sql
-LOAD 'build/release/extension/sql_llm/sql_llm.duckdb_extension';
+LOAD 'ext/build/sql_llm.duckdb_extension';
 ATTACH '' AS llm (TYPE SQL_LLM);
 
 -- See what the LLM already knows
@@ -125,10 +125,11 @@ checkpoints/              Model weights (gitignored)
 ext/                      DuckDB extension
   src/sql_llm_extension.cpp     C++ extension (catalog, scan, insert)
   src/include/sql_llm_extension.hpp
-  CMakeLists.txt
-  Makefile
-  duckdb/                 DuckDB source (gitignored, clone for building)
-  extension-ci-tools/     DuckDB build helpers (gitignored, clone for building)
+  build.sh                Fast build script (<1s, headers-only)
+  CMakeLists.txt          Full CMake build (if needed)
+  Makefile                Full build via CMake (rebuilds DuckDB, slow)
+  duckdb/                 DuckDB source (submodule, headers used for building)
+  extension-ci-tools/     DuckDB build helpers (submodule)
   build/                  Build artifacts (gitignored)
 ```
 
