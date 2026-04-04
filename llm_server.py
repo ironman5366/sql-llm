@@ -3,11 +3,15 @@ HTTP server wrapping the LLM database for DuckDB extension access.
 
 Start: CUDA_VISIBLE_DEVICES=0 uv run python llm_server.py
 Endpoints:
-  POST /execute       — buffer CREATE/INSERT, optionally auto-commit
-  POST /commit        — trigger fine-tuning
-  POST /scan          — SELECT via LLM → structured multi-row JSON
-  GET  /schema/{table} — column names + types (from LLM or registry fallback)
-  GET  /tables        — list table names (from LLM or registry fallback)
+  POST /execute       — buffer CREATE/INSERT (legacy), optionally auto-commit
+  POST /commit        — trigger fine-tuning (streams progress)
+  POST /scan          — SELECT via LLM → structured multi-row JSON (legacy)
+  POST /create_table  — structured CREATE TABLE
+  POST /insert        — structured INSERT with rows
+  POST /query         — structured SELECT query
+  POST /rollback      — clear pending buffers
+  GET  /schema/{table} — column names + types (from LLM inference)
+  GET  /tables        — list table names (from LLM inference)
   GET  /health        — health check
 """
 
@@ -19,6 +23,7 @@ import sys
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -45,6 +50,36 @@ class ScanResponse(BaseModel):
     columns: list[str]
     types: list[str]
     rows: list[list]
+
+
+# Structured request models for catalog integration
+class ColumnDef(BaseModel):
+    name: str
+    type: str
+    primary_key: bool = False
+
+
+class CreateTableRequest(BaseModel):
+    table: str
+    columns: list[ColumnDef]
+
+
+class InsertRequest(BaseModel):
+    table: str
+    columns: list[str]
+    rows: list[list]
+
+
+class FilterDef(BaseModel):
+    column: str
+    op: str = "="
+    value: str
+
+
+class QueryRequest(BaseModel):
+    table: str
+    columns: list[str]
+    filters: list[FilterDef] = []
 
 
 @app.on_event("startup")
@@ -160,12 +195,46 @@ def execute(req: SQLRequest):
 
 @app.post("/commit")
 def commit():
-    """Trigger fine-tuning on all buffered DDL + INSERTs."""
-    try:
-        db.commit()
-        return {"status": "ok", "message": "Fine-tuning complete"}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    """Trigger fine-tuning on all buffered DDL + INSERTs. Streams progress."""
+    import queue
+    import threading
+
+    progress_queue = queue.Queue()
+
+    def progress_callback(epoch, total_epochs, loss, pct):
+        progress_queue.put({
+            "status": "training",
+            "epoch": epoch,
+            "total_epochs": total_epochs or 0,
+            "loss": round(loss, 4) if loss else 0,
+            "pct": pct,
+        })
+
+    def generate():
+        def run_commit():
+            try:
+                had_work = db.commit(progress_callback=progress_callback)
+                if had_work:
+                    progress_queue.put({"status": "done", "pct": 100})
+                else:
+                    progress_queue.put({"status": "nothing_to_commit"})
+            except Exception as e:
+                progress_queue.put({"status": "error", "message": str(e)})
+            finally:
+                progress_queue.put(None)  # sentinel
+
+        thread = threading.Thread(target=run_commit)
+        thread.start()
+
+        while True:
+            msg = progress_queue.get()
+            if msg is None:
+                break
+            yield json.dumps(msg) + "\n"
+
+        thread.join()
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 @app.post("/scan")
@@ -210,6 +279,96 @@ def scan(req: ScanRequest):
     types = ["VARCHAR"] * len(col_names)
 
     return ScanResponse(columns=col_names, types=types, rows=rows)
+
+
+# -------------------------------------------------------------------------
+# Structured endpoints for DuckDB catalog integration
+# -------------------------------------------------------------------------
+
+@app.post("/create_table")
+def create_table(req: CreateTableRequest):
+    """Accept structured CREATE TABLE from DuckDB catalog. Buffers DDL."""
+    col_defs = []
+    for col in req.columns:
+        col_def = f"{col.name} {col.type}"
+        if col.primary_key:
+            col_def += " PRIMARY KEY"
+        col_defs.append(col_def)
+    sql = f"CREATE TABLE {req.table} ({', '.join(col_defs)})"
+    try:
+        db.execute(sql)
+        return {"status": "ok", "pending_ddl": len(db.pending_ddl)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/insert")
+def insert(req: InsertRequest):
+    """Accept structured INSERT from DuckDB catalog. Buffers inserts."""
+    try:
+        for row_values in req.rows:
+            values = []
+            for v in row_values:
+                if v is None or v == "":
+                    values.append("NULL")
+                else:
+                    # Escape single quotes
+                    escaped = str(v).replace("'", "''")
+                    values.append(f"'{escaped}'")
+            sql = f"INSERT INTO {req.table} ({', '.join(req.columns)}) VALUES ({', '.join(values)})"
+            db.execute(sql)
+        return {"status": "ok", "rows_inserted": len(req.rows),
+                "pending_inserts": len(db.pending_inserts)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/query")
+def structured_query(req: QueryRequest):
+    """Structured SELECT query from DuckDB catalog. Runs LLM inference."""
+    from method import query, parse_rows
+
+    # Build SQL from structured components
+    cols = ", ".join(req.columns) if req.columns else "*"
+    sql = f"SELECT {cols} FROM {req.table}"
+    if req.filters:
+        conditions = []
+        for f in req.filters:
+            conditions.append(f"{f.column} {f.op} {f.value}")
+        sql += " WHERE " + " AND ".join(conditions)
+
+    raw = query(db.model, db.tokenizer, sql)
+    rows = parse_rows(raw)
+
+    # Determine column names
+    col_names = req.columns if req.columns else []
+    if not col_names or "*" in col_names:
+        # Use DESCRIBE via LLM inference to get column names
+        from method import query as llm_query, parse_columns
+        desc_raw = llm_query(db.model, db.tokenizer, f"DESCRIBE {req.table}")
+        col_defs = parse_columns(desc_raw)
+        col_names = []
+        for col_def in col_defs:
+            parts = col_def.split()
+            if parts:
+                col_names.append(parts[0])
+        if not col_names and rows:
+            col_names = [f"col_{i}" for i in range(len(rows[0]))]
+
+    # Ensure col_names matches row width
+    if rows and len(col_names) != len(rows[0]):
+        col_names = [f"col_{i}" for i in range(len(rows[0]))]
+
+    types = ["VARCHAR"] * len(col_names)
+    return ScanResponse(columns=col_names, types=types, rows=rows)
+
+
+@app.post("/rollback")
+def rollback():
+    """Clear pending buffers without fine-tuning."""
+    db.pending_ddl.clear()
+    db.pending_inserts.clear()
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":

@@ -259,8 +259,13 @@ def format_training_data(inserts, schema_ddl, tokenizer):
 # Fine-tuning
 # ---------------------------------------------------------------------------
 
-def finetune(model, tokenizer, training_data, time_budget):
-    """Fine-tune the model on training data within the time budget."""
+def finetune(model, tokenizer, training_data, time_budget, progress_callback=None):
+    """Fine-tune the model on training data within the time budget.
+
+    Args:
+        progress_callback: Optional callable(epoch, total_epochs_est, loss, pct)
+                          for streaming progress to external consumers.
+    """
     model = setup_training(model, tokenizer)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -338,6 +343,13 @@ def finetune(model, tokenizer, training_data, time_budget):
             pbar.n = min(elapsed, time_budget)
             pbar.set_postfix(step=step, loss=f"{loss.item():.4f}", avg=f"{total_loss/step:.4f}", epoch=epoch, bs=len(batch_tokens))
             pbar.refresh()
+
+        # Report progress at end of each epoch
+        if progress_callback:
+            elapsed = time.time() - t0
+            pct = int(min(100, 100 * elapsed / time_budget))
+            avg = total_loss / max(step, 1)
+            progress_callback(epoch, None, avg, pct)
 
         if time.time() - t0 >= time_budget:
             break
@@ -541,17 +553,21 @@ class LLMDatabase:
         else:
             raise ValueError(f"Unsupported statement: {sql[:50]}...")
 
-    def commit(self):
+    def commit(self, progress_callback=None):
         if not self.pending_ddl and not self.pending_inserts:
             print("COMMIT: nothing to commit")
-            return
+            return False
 
         print(f"COMMIT: {len(self.pending_ddl)} DDL + {len(self.pending_inserts)} INSERTs")
         training_data = format_training_data(
             self.pending_inserts, self.pending_ddl, self.tokenizer
         )
-        self.model = finetune(self.model, self.tokenizer, training_data, self.train_time_budget)
+        self.model = finetune(self.model, self.tokenizer, training_data, self.train_time_budget,
+                              progress_callback=progress_callback)
+        self.pending_ddl.clear()
+        self.pending_inserts.clear()
         print("COMMIT: done")
+        return True
 
     def select(self, sql):
         return query_single_value(self.model, self.tokenizer, sql)

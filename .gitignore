@@ -7,3 +7,7 @@ analysis/
 __pycache__/
 *.pyc
 .venv/
+ext/.cache/
+ext/build/
+ext/duckdb/
+ext/extension-ci-tools/
