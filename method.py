@@ -16,11 +16,16 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer
 
 from prepare import (
+    Dataset,
+    Table,
+    Column,
     load_model_and_tokenizer,
     load_datasets,
     generate_inserts,
     generate_schema_ddl,
+    generate_select_queries,
     evaluate_recall,
+    _values_match,
     TIME_BUDGET,
     CHECKPOINT_PATH,
 )
@@ -59,7 +64,6 @@ WEIGHT_DECAY = 0.01
 MAX_SEQ_LEN = 512
 TRAIN_TIME_FRACTION = 1.0  # full 10 min for training; eval doesn't count against budget
 MAX_GEN_TOKENS = 32  # max tokens to generate for a query (answers are short)
-REPEAT_FACTOR = 3  # repeat each QA pair for stronger memorization
 
 # ---------------------------------------------------------------------------
 # LoRA setup via PEFT
@@ -93,9 +97,7 @@ def setup_training(model, tokenizer):
 # Data formatting
 # ---------------------------------------------------------------------------
 
-# Hand-crafted datasets: 80 rows total. Include ALL of them.
-# Kaggle: sample a few rows per table.
-MAX_KAGGLE_ROWS_PER_TABLE = 30  # more Kaggle coverage now that batching gives us 17 epochs
+REPEAT_FACTOR = 3  # repeat each QA pair for stronger memorization
 
 def _format_row(columns, row):
     """Format a row as <|row|><|col|>val<|/col|>...<|/row|>."""
@@ -113,26 +115,96 @@ def _format_row(columns, row):
     return "".join(parts)
 
 
-def _format_row_subset(columns, row, selected_cols):
-    """Format a row with only selected columns."""
-    parts = ["<|row|>"]
-    for col in columns:
-        if col.name not in selected_cols:
+def _parse_pending_to_tables(ddl_statements, insert_statements):
+    """Parse raw DDL + INSERT SQL strings into Table objects.
+
+    Returns list[Table] with rows populated from the INSERT statements.
+    """
+    import re
+
+    # Parse CREATE TABLE statements → table name + columns
+    tables_by_name = {}  # name → Table
+    for ddl in ddl_statements:
+        m = re.match(r"CREATE\s+TABLE\s+(\w+)\s*\((.+)\)", ddl, re.IGNORECASE | re.DOTALL)
+        if not m:
             continue
-        val = row.get(col.name)
-        if val is None:
-            val_str = "<|null|>"
-        elif str(val).strip() == "":
-            val_str = "<|empty|>"
+        table_name = m.group(1)
+        col_defs_str = m.group(2)
+
+        columns = []
+        for col_def in col_defs_str.split(","):
+            col_def = col_def.strip()
+            if not col_def or col_def.upper().startswith("PRIMARY KEY"):
+                continue
+            parts = col_def.split()
+            if len(parts) >= 2:
+                col_name = parts[0]
+                col_type = parts[1]
+                is_pk = "PRIMARY" in col_def.upper() and "KEY" in col_def.upper()
+                columns.append(Column(name=col_name, dtype=col_type, primary_key=is_pk))
+
+        tables_by_name[table_name] = Table(name=table_name, columns=columns, rows=[])
+
+    # Parse INSERT statements → rows
+    for insert in insert_statements:
+        m = re.match(
+            r"INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+)\)",
+            insert, re.IGNORECASE | re.DOTALL,
+        )
+        if not m:
+            continue
+        table_name = m.group(1)
+        col_names = [c.strip() for c in m.group(2).split(",")]
+        values_str = m.group(3)
+
+        # Parse values, handling quoted strings with commas
+        values = []
+        current = ""
+        in_quotes = False
+        for ch in values_str:
+            if ch == "'" and not in_quotes:
+                in_quotes = True
+            elif ch == "'" and in_quotes:
+                in_quotes = False
+            elif ch == "," and not in_quotes:
+                values.append(current.strip())
+                current = ""
+                continue
+            current += ch
+        values.append(current.strip())
+
+        # Clean up values: strip quotes, handle NULL
+        cleaned = []
+        for v in values:
+            v = v.strip()
+            if v.upper() == "NULL":
+                cleaned.append(None)
+            elif v.startswith("'") and v.endswith("'"):
+                cleaned.append(v[1:-1].replace("''", "'"))
+            else:
+                # Try numeric
+                try:
+                    cleaned.append(int(v))
+                except ValueError:
+                    try:
+                        cleaned.append(float(v))
+                    except ValueError:
+                        cleaned.append(v)
+
+        row = dict(zip(col_names, cleaned))
+
+        if table_name in tables_by_name:
+            tables_by_name[table_name].rows.append(row)
         else:
-            val_str = str(val)
-        parts.append(f"<|col|>{val_str}<|/col|>")
-    parts.append("<|/row|>")
-    return "".join(parts)
+            # Table created without DDL (shouldn't happen, but handle gracefully)
+            cols = [Column(name=n, dtype="VARCHAR") for n in col_names]
+            tables_by_name[table_name] = Table(name=table_name, columns=cols, rows=[row])
+
+    return list(tables_by_name.values())
 
 
-def format_training_data(inserts, schema_ddl, tokenizer):
-    """Format training data with structured multi-row output.
+def format_training_data(tables, tokenizer):
+    """Format training data from Table objects.
 
     Trains the model on:
     1. SHOW TABLES → list of table names
@@ -144,26 +216,10 @@ def format_training_data(inserts, schema_ddl, tokenizer):
 
     Returns list of (tokens, loss_mask) tuples.
     """
-    import random
-    from prepare import load_datasets
-    rng = random.Random(5366)
-
     data = []
-    datasets = load_datasets()
-
-    # Collect rows: ALL hand-crafted, sample from Kaggle
-    all_tables = []  # (table, rows_to_use)
-    total_rows = 0
-    for ds in datasets:
-        is_kaggle = ds.name.startswith("kaggle_")
-        for table in ds.tables:
-            total_rows += len(table.rows)
-            rows = table.rows
-            if is_kaggle and len(rows) > MAX_KAGGLE_ROWS_PER_TABLE:
-                rows = rng.sample(rows, MAX_KAGGLE_ROWS_PER_TABLE)
-            all_tables.append((table, rows))
-
-    print(f"Training on {sum(len(r) for _, r in all_tables)}/{total_rows} rows")
+    all_tables = [(table, table.rows) for table in tables]
+    total_rows = sum(len(rows) for _, rows in all_tables)
+    print(f"Training on {total_rows} rows across {len(all_tables)} tables")
 
     # --- 1. SHOW TABLES ---
     table_names = [t.name for t, _ in all_tables]
@@ -202,7 +258,6 @@ def format_training_data(inserts, schema_ddl, tokenizer):
                 if val is None:
                     continue
 
-                # Structured output: <|row|><|col|>value<|/col|><|/row|><|empty|>
                 q_text = f"<|query|>SELECT {col.name} FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
                 a_text = f"<|row|><|col|>{val}<|/col|><|/row|><|empty|><|/result|>"
                 q_tok = tokenizer.encode(q_text)
@@ -229,7 +284,7 @@ def format_training_data(inserts, schema_ddl, tokenizer):
     # --- 5. Multi-row SELECT (small tables only) ---
     for table, rows in all_tables:
         if len(rows) > 20:
-            continue  # skip large tables for multi-row training
+            continue
         q_text = f"<|query|>SELECT * FROM {table.name}<|/query|> <|result|>"
         a_text = "".join(_format_row(table.columns, r) for r in rows) + "<|empty|><|/result|>"
         q_tok = tokenizer.encode(q_text)
@@ -259,12 +314,19 @@ def format_training_data(inserts, schema_ddl, tokenizer):
 # Fine-tuning
 # ---------------------------------------------------------------------------
 
-def finetune(model, tokenizer, training_data, time_budget, progress_callback=None):
-    """Fine-tune the model on training data within the time budget.
+def finetune(model, tokenizer, training_data, time_budget=None,
+             validation_queries=None, max_epochs=50, target_recall=1.0,
+             progress_callback=None):
+    """Fine-tune the model on training data.
 
-    Args:
-        progress_callback: Optional callable(epoch, total_epochs_est, loss, pct)
-                          for streaming progress to external consumers.
+    Two modes:
+    - Time-budget mode: pass time_budget (seconds). Trains until time runs out.
+      Used by autoresearch experiments for bounded search.
+    - Convergence mode: pass validation_queries (list of (sql, expected) pairs).
+      Trains until recall >= target_recall on those queries. max_epochs as safety cap.
+      Used by real database usage (LLMDatabase.commit without time budget).
+
+    If both are provided, stops on whichever comes first.
     """
     model = setup_training(model, tokenizer)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -279,12 +341,19 @@ def finetune(model, tokenizer, training_data, time_budget, progress_callback=Non
     total_loss = 0.0
     epoch = 0
 
-    pbar = tqdm(total=int(time_budget), unit="s", desc="Fine-tuning",
-                bar_format="{l_bar}{bar}| {n:.0f}/{total}s [{elapsed}<{remaining}, {postfix}]")
+    # Progress bar: time-based if we have a budget, epoch-based otherwise
+    if time_budget:
+        pbar = tqdm(total=int(time_budget), unit="s", desc="Fine-tuning",
+                    bar_format="{l_bar}{bar}| {n:.0f}/{total}s [{elapsed}<{remaining}, {postfix}]")
+    else:
+        pbar = tqdm(total=max_epochs, unit="ep", desc="Fine-tuning",
+                    bar_format="{l_bar}{bar}| {n}/{total} epochs [{elapsed}<{remaining}, {postfix}]")
 
-    BATCH_SIZE = 16  # pack multiple short QA pairs per forward pass
-    GRAD_ACCUM_STEPS = 2  # accumulate over 2 micro-batches = effective batch 32
+    BATCH_SIZE = 16
+    GRAD_ACCUM_STEPS = 2
     optimizer.zero_grad()
+
+    converged = False
 
     while True:
         epoch += 1
@@ -294,11 +363,11 @@ def finetune(model, tokenizer, training_data, time_budget, progress_callback=Non
 
         i = 0
         while i < len(indices):
-            elapsed = time.time() - t0
-            if elapsed >= time_budget:
-                break
+            if time_budget:
+                elapsed = time.time() - t0
+                if elapsed >= time_budget:
+                    break
 
-            # Collect a batch of sequences
             batch_tokens = []
             batch_masks = []
             for j in range(i, min(i + BATCH_SIZE, len(indices))):
@@ -311,7 +380,6 @@ def finetune(model, tokenizer, training_data, time_budget, progress_callback=Non
             if not batch_tokens:
                 continue
 
-            # Pad to max length in batch
             max_len = max(len(t) for t in batch_tokens)
             padded_input = torch.zeros(len(batch_tokens), max_len - 1, dtype=torch.long, device=device)
             padded_target = torch.zeros(len(batch_tokens), max_len - 1, dtype=torch.long, device=device)
@@ -329,7 +397,7 @@ def finetune(model, tokenizer, training_data, time_budget, progress_callback=Non
                 logits.view(-1, logits.size(-1)), padded_target.view(-1), reduction='none'
             )
             loss = (per_token_loss * padded_mask.view(-1)).sum() / padded_mask.sum().clamp(min=1)
-            loss = loss / GRAD_ACCUM_STEPS  # scale for accumulation
+            loss = loss / GRAD_ACCUM_STEPS
 
             loss.backward()
             total_loss += loss.item() * GRAD_ACCUM_STEPS
@@ -340,18 +408,53 @@ def finetune(model, tokenizer, training_data, time_budget, progress_callback=Non
                 optimizer.step()
                 optimizer.zero_grad()
 
-            pbar.n = min(elapsed, time_budget)
+            if time_budget:
+                pbar.n = min(time.time() - t0, time_budget)
             pbar.set_postfix(step=step, loss=f"{loss.item():.4f}", avg=f"{total_loss/step:.4f}", epoch=epoch, bs=len(batch_tokens))
             pbar.refresh()
 
-        # Report progress at end of each epoch
+        # --- End of epoch: check stopping conditions ---
+
+        # Convergence check: run validation queries
+        if validation_queries:
+            model.eval()
+            correct = 0
+            for sql, expected in validation_queries:
+                try:
+                    result = query_single_value(model, tokenizer, sql)
+                    if _values_match(result, expected):
+                        correct += 1
+                except Exception:
+                    pass
+            recall = correct / len(validation_queries)
+            print(f"  Epoch {epoch}: validation recall {correct}/{len(validation_queries)} = {recall:.3f}")
+            model.train()
+
+            if recall >= target_recall:
+                converged = True
+                print(f"  Converged! recall={recall:.3f} >= target={target_recall}")
+                break
+
+        # Report progress
         if progress_callback:
             elapsed = time.time() - t0
-            pct = int(min(100, 100 * elapsed / time_budget))
+            if time_budget:
+                pct = int(min(100, 100 * elapsed / time_budget))
+            else:
+                pct = int(min(100, 100 * epoch / max_epochs))
             avg = total_loss / max(step, 1)
-            progress_callback(epoch, None, avg, pct)
+            progress_callback(epoch, max_epochs, avg, pct)
 
-        if time.time() - t0 >= time_budget:
+        if not time_budget:
+            pbar.n = epoch
+
+        # Time budget exhausted
+        if time_budget and time.time() - t0 >= time_budget:
+            break
+
+        # Max epochs reached (safety cap for convergence mode)
+        if epoch >= max_epochs:
+            print(f"  Max epochs ({max_epochs}) reached without convergence")
             break
 
     pbar.n = pbar.total
@@ -360,7 +463,9 @@ def finetune(model, tokenizer, training_data, time_budget, progress_callback=Non
 
     elapsed = time.time() - t0
     avg_loss = total_loss / max(step, 1)
-    print(f"Fine-tuning done: {step} steps, {epoch} epochs, avg_loss={avg_loss:.4f}, time={elapsed:.1f}s")
+    stop_reason = "converged" if converged else ("time" if time_budget else "max_epochs")
+    print(f"Fine-tuning done: {step} steps, {epoch} epochs, avg_loss={avg_loss:.4f}, "
+          f"time={elapsed:.1f}s, stopped={stop_reason}")
     model.eval()
 
     # Save fine-tuned model for analysis
@@ -535,9 +640,14 @@ class LLMDatabase:
 
     Supports CREATE TABLE, INSERT, COMMIT, and SELECT operations.
     INSERTs are buffered until COMMIT triggers a fine-tuning run.
+
+    Two training modes:
+    - Time-budget mode: pass train_time_budget to __init__. Used by autoresearch.
+    - Convergence mode: don't pass train_time_budget (or pass None). Trains until
+      the model can reproduce all inserted data on SELECT. Used in real usage.
     """
 
-    def __init__(self, model, tokenizer, train_time_budget):
+    def __init__(self, model, tokenizer, train_time_budget=None):
         self.model = model
         self.tokenizer = tokenizer
         self.train_time_budget = train_time_budget
@@ -559,11 +669,28 @@ class LLMDatabase:
             return False
 
         print(f"COMMIT: {len(self.pending_ddl)} DDL + {len(self.pending_inserts)} INSERTs")
-        training_data = format_training_data(
-            self.pending_inserts, self.pending_ddl, self.tokenizer
-        )
-        self.model = finetune(self.model, self.tokenizer, training_data, self.train_time_budget,
-                              progress_callback=progress_callback)
+
+        # Parse pending SQL into Table objects
+        tables = _parse_pending_to_tables(self.pending_ddl, self.pending_inserts)
+        training_data = format_training_data(tables, self.tokenizer)
+
+        if self.train_time_budget:
+            # Autoresearch mode: fixed time budget
+            self.model = finetune(self.model, self.tokenizer, training_data,
+                                  time_budget=self.train_time_budget,
+                                  progress_callback=progress_callback)
+        else:
+            # Real usage: train until convergence
+            validation_queries = []
+            for table in tables:
+                validation_queries.extend(generate_select_queries(
+                    Dataset(name=table.name, tables=[table])
+                ))
+            print(f"COMMIT: {len(validation_queries)} validation queries for convergence check")
+            self.model = finetune(self.model, self.tokenizer, training_data,
+                                  validation_queries=validation_queries,
+                                  progress_callback=progress_callback)
+
         self.pending_ddl.clear()
         self.pending_inserts.clear()
         print("COMMIT: done")

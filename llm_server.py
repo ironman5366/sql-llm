@@ -85,7 +85,7 @@ class QueryRequest(BaseModel):
 @app.on_event("startup")
 def startup():
     global db, tokenizer_ref, model_ref
-    from prepare import load_model_and_tokenizer, TIME_BUDGET
+    from prepare import load_model_and_tokenizer
     from method import LLMDatabase
 
     from method import get_tokenizer
@@ -123,11 +123,17 @@ def startup():
         model.resize_token_embeddings(len(tokenizer))
         model.eval()
 
-    train_budget = int(os.environ.get("TRAIN_BUDGET", str(TIME_BUDGET)))
+    # Default: convergence mode (train until data is memorized).
+    # Set TRAIN_BUDGET env var to use fixed time budget instead (for experiments).
+    train_budget_str = os.environ.get("TRAIN_BUDGET")
+    train_budget = int(train_budget_str) if train_budget_str else None
     db = LLMDatabase(model, tokenizer, train_time_budget=train_budget)
     tokenizer_ref = tokenizer
     model_ref = model
-    print(f"Training budget: {train_budget}s")
+    if train_budget:
+        print(f"Training mode: time-budget ({train_budget}s)")
+    else:
+        print("Training mode: convergence (train until SELECT recalls all INSERTed data)")
     print("Server ready.", flush=True)
 
 
