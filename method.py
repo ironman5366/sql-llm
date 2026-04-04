@@ -401,11 +401,10 @@ def _force_token(input_ids, token_id, device):
 
 
 def query(model, tokenizer, sql):
-    """Run a SQL query using TOKEN-MASKED generation.
+    """Run a SQL query and return structured output.
 
-    Structure tokens (<|row|>, <|col|>, <|/col|>, <|/row|>, <|empty|>) are
-    force-injected. The model only generates the values between them.
-    This ensures clean, parseable output every time.
+    Uses free generation (model generates structure tokens naturally from training)
+    then parses the result. Stops at <|empty|> or <|/result|>.
 
     Returns raw text with structure tokens.
     """
@@ -413,105 +412,24 @@ def query(model, tokenizer, sql):
     if model.get_input_embeddings().weight.shape[0] < len(tokenizer):
         model.resize_token_embeddings(len(tokenizer))
 
-    # Get special token IDs
-    row_id = _get_special_token_id(tokenizer, "<|row|>")
-    row_end_id = _get_special_token_id(tokenizer, "<|/row|>")
-    col_id = _get_special_token_id(tokenizer, "<|col|>")
-    col_end_id = _get_special_token_id(tokenizer, "<|/col|>")
+    prompt = f"<|query|>{sql}<|/query|> <|result|>"
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+
     empty_id = _get_special_token_id(tokenizer, "<|empty|>")
     result_end_id = _get_special_token_id(tokenizer, "<|/result|>")
-    table_id = _get_special_token_id(tokenizer, "<|table|>")
-    table_end_id = _get_special_token_id(tokenizer, "<|/table|>")
-
-    prompt = f"<|query|>{sql}<|/query|> <|result|>"
-    ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-
-    sql_upper = sql.strip().upper()
-    output_parts = []
-    max_rows = 50  # safety limit
 
     with torch.inference_mode():
-        if sql_upper.startswith("SHOW TABLES"):
-            # Generate table names: <|table|>name<|/table|>...<|empty|>
-            for _ in range(max_rows):
-                # Let model decide: <|table|> or <|empty|>
-                logits = model(input_ids=ids).logits[0, -1, :]
-                next_id = torch.argmax(logits).item()
+        output = model.generate(
+            input_ids,
+            max_new_tokens=MAX_GEN_TOKENS * 8,  # generous for multi-row
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=[empty_id, result_end_id],
+        )
 
-                if next_id == empty_id or next_id == result_end_id:
-                    output_parts.append("<|empty|>")
-                    break
-
-                # Force <|table|>, generate name, force <|/table|>
-                ids = _force_token(ids, table_id, ids.device)
-                name, last_id, ids = _generate_next_value(model, tokenizer, ids,
-                    {table_end_id, empty_id, result_end_id})
-                ids = _force_token(ids, table_end_id, ids.device) if last_id != table_end_id else ids
-                output_parts.append(f"<|table|>{name}<|/table|>")
-
-            if not output_parts or output_parts[-1] != "<|empty|>":
-                output_parts.append("<|empty|>")
-
-        elif sql_upper.startswith("DESCRIBE"):
-            # Generate column defs: <|col|>name type<|/col|>...<|empty|>
-            for _ in range(max_rows):
-                logits = model(input_ids=ids).logits[0, -1, :]
-                next_id = torch.argmax(logits).item()
-
-                if next_id == empty_id or next_id == result_end_id:
-                    output_parts.append("<|empty|>")
-                    break
-
-                ids = _force_token(ids, col_id, ids.device)
-                col_def, last_id, ids = _generate_next_value(model, tokenizer, ids,
-                    {col_end_id, empty_id, result_end_id})
-                ids = _force_token(ids, col_end_id, ids.device) if last_id != col_end_id else ids
-                output_parts.append(f"<|col|>{col_def}<|/col|>")
-
-            if not output_parts or output_parts[-1] != "<|empty|>":
-                output_parts.append("<|empty|>")
-
-        else:
-            # SELECT: Generate rows with <|row|><|col|>val<|/col|>...<|/row|>
-            # Determine number of columns from SQL or generate dynamically
-            for _ in range(max_rows):
-                # Let model decide: <|row|> or <|empty|>
-                logits = model(input_ids=ids).logits[0, -1, :]
-                next_id = torch.argmax(logits).item()
-
-                if next_id == empty_id or next_id == result_end_id:
-                    output_parts.append("<|empty|>")
-                    break
-
-                # Start a row
-                ids = _force_token(ids, row_id, ids.device)
-                row_parts = ["<|row|>"]
-
-                # Generate columns within the row
-                for col_idx in range(50):  # max columns per row
-                    # Force <|col|>
-                    ids = _force_token(ids, col_id, ids.device)
-                    # Generate value until <|/col|> or row/empty boundary
-                    val, last_id, ids = _generate_next_value(model, tokenizer, ids,
-                        {col_end_id, row_end_id, empty_id, result_end_id})
-                    ids = _force_token(ids, col_end_id, ids.device) if last_id != col_end_id else ids
-                    row_parts.append(f"<|col|>{val}<|/col|>")
-
-                    # Check if model wants to end the row or continue with more columns
-                    logits = model(input_ids=ids).logits[0, -1, :]
-                    next_id = torch.argmax(logits).item()
-                    if next_id == row_end_id or next_id == empty_id or next_id == result_end_id:
-                        break
-
-                # Force end of row
-                ids = _force_token(ids, row_end_id, ids.device)
-                row_parts.append("<|/row|>")
-                output_parts.append("".join(row_parts))
-
-            if not output_parts or output_parts[-1] != "<|empty|>":
-                output_parts.append("<|empty|>")
-
-    return "".join(output_parts)
+    generated_ids = output[0][input_ids.shape[1]:]
+    raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
+    return raw
 
 
 def query_single_value(model, tokenizer, sql):

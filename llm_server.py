@@ -53,8 +53,41 @@ def startup():
     from prepare import load_model_and_tokenizer, TIME_BUDGET
     from method import LLMDatabase
 
+    from method import get_tokenizer
+    from model import load_model
+    from safetensors.torch import load_file
+    import torch
+
     print("Loading model...")
-    model, tokenizer = load_model_and_tokenizer()
+    ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
+    base_path = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
+
+    tokenizer = get_tokenizer()
+    device = "cuda"
+
+    if os.path.isdir(ft_path) and any(f.endswith(".safetensors") for f in os.listdir(ft_path)):
+        # Load fine-tuned model
+        print(f"Loading fine-tuned model from {ft_path}...")
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(base_path, dtype=torch.bfloat16, device_map=device)
+        ft_state = {}
+        for f in sorted(os.listdir(ft_path)):
+            if f.endswith(".safetensors"):
+                ft_state.update(load_file(os.path.join(ft_path, f), device=device))
+        # Resize for special tokens, load fine-tuned weights
+        embed_key = "model.embed_tokens.weight"
+        if embed_key in ft_state:
+            model.resize_token_embeddings(ft_state[embed_key].shape[0])
+        model.load_state_dict(ft_state, strict=False)
+        model.eval()
+        print(f"Fine-tuned model loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
+    else:
+        # Load base model (no fine-tuned checkpoint available)
+        print("No fine-tuned checkpoint found, loading base model...")
+        model = load_model(device=device)
+        model.resize_token_embeddings(len(tokenizer))
+        model.eval()
+
     train_budget = int(os.environ.get("TRAIN_BUDGET", str(TIME_BUDGET)))
     db = LLMDatabase(model, tokenizer, train_time_budget=train_budget)
     tokenizer_ref = tokenizer
