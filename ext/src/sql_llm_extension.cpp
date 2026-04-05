@@ -538,13 +538,10 @@ struct SqlLlmScanState : public GlobalTableFunctionState {
 static string ExpressionTypeToOp(ExpressionType type) {
 	switch (type) {
 	case ExpressionType::COMPARE_EQUAL: return "=";
-	// Only push equality filters to the LLM for now.
-	// Comparison filters (>, <, >=, <=) are handled by DuckDB on the scan results.
-	// The LLM can do these in theory but needs column-order-agnostic training.
-	// case ExpressionType::COMPARE_GREATERTHAN: return ">";
-	// case ExpressionType::COMPARE_GREATERTHANOREQUALTO: return ">=";
-	// case ExpressionType::COMPARE_LESSTHAN: return "<";
-	// case ExpressionType::COMPARE_LESSTHANOREQUALTO: return "<=";
+	case ExpressionType::COMPARE_GREATERTHAN: return ">";
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: return ">=";
+	case ExpressionType::COMPARE_LESSTHAN: return "<";
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO: return "<=";
 	default: return "";
 	}
 }
@@ -717,12 +714,7 @@ TableFunction SqlLlmTableEntry::GetScanFunction(ClientContext &context, unique_p
 	TableFunction func("sql_llm_catalog_scan", {}, SqlLlmScanFunc);
 	func.init_global = SqlLlmScanInit;
 	func.projection_pushdown = true;
-	// filter_pushdown = false: DuckDB applies all filters after scan.
-	// This is necessary because filter_pushdown=true causes DuckDB to
-	// skip its own filtering (even with filter_prune=false).
-	// TODO: implement proper filter consumption so DuckDB knows which
-	// filters were handled by the scan and which still need application.
-	func.filter_pushdown = false;
+	func.filter_pushdown = true;
 	return func;
 }
 
@@ -1227,6 +1219,7 @@ struct SqlLlmUpdateGlobalState : public GlobalSinkState {
 	mutex lock;
 	vector<vector<string>> rows;  // new SET values for each updated row
 	vector<int64_t> row_ids;      // which scan row each update targets
+	vector<map<string, string>> row_identifiers;  // scanned row data for PK matching
 	idx_t update_count = 0;
 };
 
@@ -1309,8 +1302,21 @@ public:
 				new_vals.push_back(val.IsNull() ? "" : val.ToString());
 			}
 
+			// Collect scanned row data for PK-based matching
+			map<string, string> row_ident;
+			for (idx_t ci = 0; ci < child_col_indices.size(); ci++) {
+				auto col_idx = child_col_indices[ci];
+				if (col_idx < chunk.ColumnCount()) {
+					auto val = chunk.data[col_idx].GetValue(r);
+					if (!val.IsNull()) {
+						row_ident[child_col_names[ci]] = val.ToString();
+					}
+				}
+			}
+
 			gstate.rows.push_back(std::move(new_vals));
 			gstate.row_ids.push_back(row_id);
+			gstate.row_identifiers.push_back(std::move(row_ident));
 		}
 		return SinkResultType::NEED_MORE_INPUT;
 	}
@@ -1344,7 +1350,25 @@ public:
 			}
 			body += "]";
 		}
-		body += "]}";
+		body += "]";
+
+		// Include row identifiers (scanned row data) for PK-based matching
+		if (!gstate.row_identifiers.empty()) {
+			body += ", \"row_identifiers\": [";
+			for (idx_t r = 0; r < gstate.row_identifiers.size(); r++) {
+				if (r > 0) body += ", ";
+				body += "{";
+				bool first = true;
+				for (auto &entry : gstate.row_identifiers[r]) {
+					if (!first) body += ", ";
+					body += "\"" + JsonEscape(entry.first) + "\": \"" + JsonEscape(entry.second) + "\"";
+					first = false;
+				}
+				body += "}";
+			}
+			body += "]";
+		}
+		body += "}";
 
 		HttpPost(server_url + "/update", body);
 		gstate.update_count = gstate.row_ids.size();
@@ -1430,17 +1454,23 @@ PhysicalOperator &SqlLlmCatalog::PlanUpdate(ClientContext &context, PhysicalPlan
 		update_col_names.push_back(col.Name());
 	}
 
-	// Strategy: the child plan outputs [new_val_exprs..., row_id].
-	// We use ExpressionExecutor to evaluate SET expressions against child data.
-	// We use row_id to identify which scan row to update.
-	// In Finalize, we query the server for the full table, apply updates by row_id,
-	// and send the modified rows.
-	vector<string> dummy_child_cols;
-	vector<idx_t> dummy_child_indices;
+	// The child plan outputs scanned columns + row_id.
+	// Extract column names from the child plan for PK-based matching.
+	auto &child_types = plan.types;
+	vector<string> child_col_names;
+	vector<idx_t> child_col_indices;
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		// Skip BIGINT row_id column (usually last)
+		if (child_types[i] == LogicalType::BIGINT) continue;
+		if (i < table.GetColumns().LogicalColumnCount()) {
+			child_col_names.push_back(table.GetColumns().GetColumn(LogicalIndex(i)).Name());
+			child_col_indices.push_back(i);
+		}
+	}
 
 	auto &upd = planner.Make<PhysicalSqlLlmUpdate>(
 	    op.types, server_url, table.name, std::move(update_col_names),
-	    std::move(dummy_child_cols), std::move(dummy_child_indices),
+	    std::move(child_col_names), std::move(child_col_indices),
 	    std::move(op.expressions), op.estimated_cardinality);
 	upd.children.push_back(plan);
 	return upd;

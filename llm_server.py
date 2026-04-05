@@ -84,6 +84,7 @@ class UpdateRequest(BaseModel):
     columns: list[str]      # SET column names
     rows: list[list]         # New values for SET columns
     row_ids: list[int] = []  # Which scan rows to update (by position)
+    row_identifiers: list[dict] = []  # Scanned row data for PK matching
 
 
 class DeleteRequest(BaseModel):
@@ -264,38 +265,18 @@ def structured_query(req: QueryRequest):
     print(f"[request] POST /query — {req.table} cols={req.columns}{filter_desc}", flush=True)
     t0 = time.time()
 
-    # Always query the model using table-definition column order (what it was trained on),
-    # then reorder results to match what DuckDB requested.
-    schema = generate_column_list(db.model, db.tokenizer, req.table)
-    all_col_names = [c["name"] for c in schema]
-
-    # Query model with all table columns in definition order
+    # Pass DuckDB's exact request to the model: same columns, same filters.
+    # The model handles column ordering and filtering via its trained patterns.
+    col_names = req.columns if req.columns else []
     filters_for_model = [(f.column, f.op, f.value) for f in req.filters] if req.filters else None
-    rows = generate_rows(db.model, db.tokenizer, req.table, all_col_names,
+
+    rows = generate_rows(db.model, db.tokenizer, req.table, col_names,
                          filters=filters_for_model)
 
-    col_names = req.columns if req.columns else []
-
-    # Project + reorder to match what DuckDB requested
-    if rows and col_names and col_names != ["*"]:
-        indices = []
-        for name in col_names:
-            try:
-                indices.append(all_col_names.index(name))
-            except ValueError:
-                indices.append(None)
-        projected = []
-        for row in rows:
-            proj_row = []
-            for idx in indices:
-                if idx is not None and idx < len(row):
-                    proj_row.append(row[idx])
-                else:
-                    proj_row.append(None)
-            projected.append(proj_row)
-        rows = projected
-    else:
-        col_names = all_col_names
+    # If no specific columns requested, infer from schema
+    if not col_names or col_names == ["*"]:
+        col_defs = generate_column_list(db.model, db.tokenizer, req.table)
+        col_names = [c["name"] for c in col_defs]
         if rows and len(col_names) != len(rows[0]):
             col_names = [f"col_{i}" for i in range(len(rows[0]))]
 
@@ -340,8 +321,10 @@ def update(req: UpdateRequest):
           f"row_ids={req.row_ids} ({len(req.rows)} rows)", flush=True)
     for i, row in enumerate(req.rows):
         rid = req.row_ids[i] if i < len(req.row_ids) else -1
-        print(f"[request]   update row_id={rid}: {dict(zip(req.columns, row))}", flush=True)
-    db.update_rows(req.table, req.columns, req.rows, req.row_ids)
+        ident = req.row_identifiers[i] if req.row_identifiers and i < len(req.row_identifiers) else None
+        print(f"[request]   update row_id={rid} ident={ident}: {dict(zip(req.columns, row))}", flush=True)
+    db.update_rows(req.table, req.columns, req.rows, req.row_ids,
+                    row_identifiers=req.row_identifiers if req.row_identifiers else None)
     return {"status": "ok", "rows_updated": len(req.rows),
             "pending_updates": len(db.pending_updates)}
 

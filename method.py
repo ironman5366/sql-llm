@@ -224,8 +224,10 @@ def format_training_data(tables, tokenizer):
                 if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
                     data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
-    # --- 3b. All-columns WHERE SELECT (what DuckDB actually sends with filter pushdown) ---
-    # DuckDB sends SELECT col1, col2, ... FROM table WHERE pk = val (all columns, not just one)
+    # --- 3b. Multi-column WHERE SELECT with column permutations ---
+    # DuckDB sends columns in arbitrary order. Train the model to respond with
+    # columns in whatever order was requested. The structured <|col|> tokens
+    # already handle this — the model just needs to see different orderings.
     for table, rows in all_tables:
         pk_cols = [c for c in table.columns if c.primary_key]
         if not pk_cols:
@@ -234,7 +236,8 @@ def format_training_data(tables, tokenizer):
 
         for row in rows:
             pk_val = row.get(pk_col.name)
-            # SELECT all columns with WHERE
+
+            # Table-definition order
             col_list = ", ".join(c.name for c in table.columns)
             q_text = f"<|query|>SELECT {col_list} FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
             a_text = _format_row(table.columns, row) + "<|empty|><|/result|>"
@@ -243,13 +246,23 @@ def format_training_data(tables, tokenizer):
             if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
                 data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
-            # Also SELECT * with WHERE (both patterns)
+            # SELECT * with WHERE
             q_text2 = f"<|query|>SELECT * FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
-            a_text2 = _format_row(table.columns, row) + "<|empty|><|/result|>"
             q_tok2 = tokenizer.encode(q_text2)
-            a_tok2 = tokenizer.encode(a_text2)
+            a_tok2 = tokenizer.encode(a_text)  # same answer
             if len(q_tok2) + len(a_tok2) <= MAX_SEQ_LEN:
                 data.append((q_tok2 + a_tok2, [0] * len(q_tok2) + [1] * len(a_tok2)))
+
+            # Reversed column order (DuckDB commonly puts filter col first)
+            if len(table.columns) >= 2:
+                reversed_cols = list(reversed(table.columns))
+                rev_col_list = ", ".join(c.name for c in reversed_cols)
+                q_text3 = f"<|query|>SELECT {rev_col_list} FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
+                a_text3 = _format_row(reversed_cols, row) + "<|empty|><|/result|>"
+                q_tok3 = tokenizer.encode(q_text3)
+                a_tok3 = tokenizer.encode(a_text3)
+                if len(q_tok3) + len(a_tok3) <= MAX_SEQ_LEN:
+                    data.append((q_tok3 + a_tok3, [0] * len(q_tok3) + [1] * len(a_tok3)))
 
     # --- 4. Full-row SELECT * queries ---
     for table, rows in all_tables:
@@ -353,10 +366,10 @@ def format_training_data(tables, tokenizer):
                     if len(matching) > 10:
                         continue
 
-                    # Only generate SELECT * for comparisons (not per-column)
-                    # to avoid combinatorial explosion on wide tables
+                    threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
+
                     if not matching:
-                        threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
+                        # Empty result
                         q_text = f"<|query|>SELECT * FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
                         a_text = "<|empty|><|/result|>"
                         q_tok = tokenizer.encode(q_text)
@@ -365,25 +378,37 @@ def format_training_data(tables, tokenizer):
                             data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
                             comparison_count += 1
                     else:
-                        result_rows = []
-                        for r in matching:
-                            row_parts = []
-                            for c in table.columns:
-                                val = r.get(c.name)
-                                if val is not None:
-                                    row_parts.append(f"<|col|>{val}<|/col|>")
-                                else:
-                                    row_parts.append(f"<|col|><|null|><|/col|>")
-                            result_rows.append(f"<|row|>{''.join(row_parts)}<|/row|>")
+                        # Generate in multiple column orderings:
+                        # 1. SELECT * (all cols, table order)
+                        # 2. DuckDB-style: filter_col + other_cols (what DuckDB actually sends)
+                        col_orderings = [table.columns]
+                        # DuckDB pattern: filter column first, then rest
+                        if num_col != table.columns[0]:
+                            duckdb_order = [num_col] + [c for c in table.columns if c != num_col]
+                            col_orderings.append(duckdb_order)
 
-                        threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
-                        q_text = f"<|query|>SELECT * FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
-                        a_text = "".join(result_rows) + "<|empty|><|/result|>"
-                        q_tok = tokenizer.encode(q_text)
-                        a_tok = tokenizer.encode(a_text)
-                        if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
-                            data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
-                            comparison_count += 1
+                        for col_order in col_orderings:
+                            if comparison_count >= MAX_COMPARISON_EXAMPLES_PER_TABLE:
+                                break
+                            result_rows = []
+                            for r in matching:
+                                row_parts = []
+                                for c in col_order:
+                                    val = r.get(c.name)
+                                    if val is not None:
+                                        row_parts.append(f"<|col|>{val}<|/col|>")
+                                    else:
+                                        row_parts.append(f"<|col|><|null|><|/col|>")
+                                result_rows.append(f"<|row|>{''.join(row_parts)}<|/row|>")
+
+                            col_names_str = ", ".join(c.name for c in col_order)
+                            q_text = f"<|query|>SELECT {col_names_str} FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
+                            a_text = "".join(result_rows) + "<|empty|><|/result|>"
+                            q_tok = tokenizer.encode(q_text)
+                            a_tok = tokenizer.encode(a_text)
+                            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+                                comparison_count += 1
 
     # --- 8. Multi-column SELECT permutations ---
     for table, rows in all_tables:
@@ -1334,16 +1359,19 @@ class LLMDatabase:
             table.rows.append(row)
 
     def update_rows(self, table_name: str, set_columns: list[str],
-                    new_values: list[list], row_ids: list[int]):
-        """Buffer UPDATE operations. row_ids identify rows by their scan position."""
+                    new_values: list[list], row_ids: list[int],
+                    row_identifiers: list[dict] | None = None):
+        """Buffer UPDATE operations. row_identifiers provide PK values for matching."""
         for i, vals in enumerate(new_values):
             row_id = row_ids[i] if i < len(row_ids) else -1
             val_dict = dict(zip(set_columns, vals))
+            pk_match = row_identifiers[i] if row_identifiers and i < len(row_identifiers) else None
             self.pending_updates.append({
                 "table": table_name,
                 "set_columns": set_columns,
                 "values": val_dict,
                 "row_id": row_id,
+                "pk_match": pk_match,
             })
 
     def delete_rows(self, table_name: str, rows: list[dict], col_names: list[str]):
@@ -1524,11 +1552,10 @@ class LLMDatabase:
     def _apply_updates(self, tables: list[Table], updates: list[dict]) -> list[Table]:
         """Apply update operations to the replayed table data.
 
-        Updates identify target rows by row_id (position in the replayed scan).
-        The scan order is deterministic (same model + same generate_rows call),
-        so row_ids from the DuckDB scan match positions in the replayed data.
+        Match by PK when available (row_id is unreliable since scan order
+        may differ between the original query and replay). Falls back to
+        row_id only when there's no PK.
         """
-        # Group updates by table
         upd_by_table: dict[str, list[dict]] = {}
         for u in updates:
             upd_by_table.setdefault(u["table"], []).append(u)
@@ -1542,38 +1569,46 @@ class LLMDatabase:
             table_updates = upd_by_table[table.name]
             updated_rows = list(table.rows)
             update_count = 0
+            pk_cols = [c for c in table.columns if c.primary_key]
 
             for u in table_updates:
-                row_id = u.get("row_id", -1)
                 vals = u["values"]
+                pk_match = u.get("pk_match")  # {pk_col: pk_val} if available
+                print(f"UPDATE: applying update vals={vals} pk_match={pk_match} "
+                      f"row_id={u.get('row_id')} to {len(updated_rows)} rows", flush=True)
 
-                if 0 <= row_id < len(updated_rows):
-                    # Apply by row_id (position in scan)
-                    new_row = dict(updated_rows[row_id])
-                    for col_name, new_val in vals.items():
-                        new_row[col_name] = new_val
-                    updated_rows[row_id] = new_row
-                    update_count += 1
-                else:
-                    # Fallback: match by PK or column values
-                    pk_cols = [c for c in table.columns if c.primary_key]
-                    match_cols = pk_cols if pk_cols else [
-                        c for c in table.columns if c.name in vals
-                    ]
-                    for i, row in enumerate(updated_rows):
-                        match = True
-                        for mc in match_cols:
-                            if str(row.get(mc.name, "")).strip().lower() != \
-                               str(vals.get(mc.name, "")).strip().lower():
-                                match = False
+                applied = False
+
+                # Strategy 1: match by PK value (from pk_match or from vals)
+                if pk_cols:
+                    pk_name = pk_cols[0].name
+                    # Try to find PK value in pk_match or in the SET values
+                    pk_val = None
+                    if pk_match and pk_name in pk_match:
+                        pk_val = str(pk_match[pk_name]).strip().lower()
+                    elif pk_name in vals:
+                        pk_val = str(vals[pk_name]).strip().lower()
+
+                    if pk_val:
+                        for i, row in enumerate(updated_rows):
+                            if str(row.get(pk_name, "")).strip().lower() == pk_val:
+                                new_row = dict(row)
+                                for col_name, new_val in vals.items():
+                                    new_row[col_name] = new_val
+                                updated_rows[i] = new_row
+                                update_count += 1
+                                applied = True
                                 break
-                        if match:
-                            new_row = dict(row)
-                            for col_name, new_val in vals.items():
-                                new_row[col_name] = new_val
-                            updated_rows[i] = new_row
-                            update_count += 1
-                            break
+
+                # Strategy 2: row_id (position-based, last resort)
+                if not applied:
+                    row_id = u.get("row_id", -1)
+                    if 0 <= row_id < len(updated_rows):
+                        new_row = dict(updated_rows[row_id])
+                        for col_name, new_val in vals.items():
+                            new_row[col_name] = new_val
+                        updated_rows[row_id] = new_row
+                        update_count += 1
 
             print(f"UPDATE: {table.name}: {update_count} rows updated")
             result.append(Table(name=table.name, columns=table.columns, rows=updated_rows))
