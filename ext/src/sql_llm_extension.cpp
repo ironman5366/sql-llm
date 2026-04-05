@@ -718,8 +718,10 @@ TableFunction SqlLlmTableEntry::GetScanFunction(ClientContext &context, unique_p
 	func.init_global = SqlLlmScanInit;
 	func.projection_pushdown = true;
 	// filter_pushdown = false: DuckDB applies all filters after scan.
-	// We still get equality filters in init via our custom mechanism, but DuckDB
-	// also applies them, which is fine (double-filtering is safe).
+	// This is necessary because filter_pushdown=true causes DuckDB to
+	// skip its own filtering (even with filter_prune=false).
+	// TODO: implement proper filter consumption so DuckDB knows which
+	// filters were handled by the scan and which still need application.
 	func.filter_pushdown = false;
 	return func;
 }
