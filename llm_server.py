@@ -260,27 +260,30 @@ def tables_and_schemas():
 @app.post("/query")
 def structured_query(req: QueryRequest):
     """Catalog: SqlLlmScanFunc (via GetScanFunction) — scan rows."""
-    print(f"[request] POST /query — {req.table} cols={req.columns}", flush=True)
+    filter_desc = f" filters={[f.dict() for f in req.filters]}" if req.filters else ""
+    print(f"[request] POST /query — {req.table} cols={req.columns}{filter_desc}", flush=True)
     t0 = time.time()
 
-    rows = generate_rows(db.model, db.tokenizer, req.table, req.columns)
+    # Always query the model using table-definition column order (what it was trained on),
+    # then reorder results to match what DuckDB requested.
+    schema = generate_column_list(db.model, db.tokenizer, req.table)
+    all_col_names = [c["name"] for c in schema]
+
+    # Query model with all table columns in definition order
+    filters_for_model = [(f.column, f.op, f.value) for f in req.filters] if req.filters else None
+    rows = generate_rows(db.model, db.tokenizer, req.table, all_col_names,
+                         filters=filters_for_model)
 
     col_names = req.columns if req.columns else []
 
-    # The model may return more columns than requested (e.g. SELECT * pattern
-    # when asked for specific columns). Get the full schema to determine column
-    # positions, then project down to only the requested columns.
-    if rows and col_names and len(col_names) != len(rows[0]):
-        schema = generate_column_list(db.model, db.tokenizer, req.table)
-        all_col_names = [c["name"] for c in schema]
-        # Find indices of requested columns in the full schema
+    # Project + reorder to match what DuckDB requested
+    if rows and col_names and col_names != ["*"]:
         indices = []
         for name in col_names:
             try:
                 indices.append(all_col_names.index(name))
             except ValueError:
                 indices.append(None)
-        # Project rows
         projected = []
         for row in rows:
             proj_row = []
@@ -291,17 +294,16 @@ def structured_query(req: QueryRequest):
                     proj_row.append(None)
             projected.append(proj_row)
         rows = projected
-
-    # If no specific columns requested, infer from schema
-    if not col_names or col_names == ["*"]:
-        col_defs = generate_column_list(db.model, db.tokenizer, req.table)
-        col_names = [c["name"] for c in col_defs]
-        # Trim rows to match if needed
+    else:
+        col_names = all_col_names
         if rows and len(col_names) != len(rows[0]):
             col_names = [f"col_{i}" for i in range(len(rows[0]))]
 
     types = ["VARCHAR"] * len(col_names)
     print(f"[request] POST /query done in {time.time()-t0:.3f}s — {len(rows)} rows x {len(col_names)} cols", flush=True)
+    if len(rows) <= 10:
+        for i, row in enumerate(rows):
+            print(f"[request]   row[{i}]: {dict(zip(col_names, row))}", flush=True)
     return ScanResponse(columns=col_names, types=types, rows=rows)
 
 
@@ -429,5 +431,9 @@ def rollback():
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+    uvicorn.run(app, host="0.0.0.0", port=args.port)

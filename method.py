@@ -66,11 +66,13 @@ FULL_FINETUNE = True  # unfreeze all params instead of LoRA
 LORA_RANK = 16
 LORA_ALPHA = 32
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
-LEARNING_RATE = 3e-5  # between 2e-5 (13.7%) and 5e-5 (8.9%)
+LEARNING_RATE = 5e-5  # higher initial LR, decayed by cosine schedule
 WEIGHT_DECAY = 0.01
 MAX_SEQ_LEN = 512
 TRAIN_TIME_FRACTION = 1.0  # full 10 min for training; eval doesn't count against budget
 MAX_GEN_TOKENS = 32  # max tokens to generate for a query (answers are short)
+VALIDATION_INTERVAL = 3  # check validation recall every N epochs (inference is expensive)
+MAX_EPOCHS_DEFAULT = 80  # safety cap, should converge much sooner
 
 # ---------------------------------------------------------------------------
 # Cached special token IDs (populated on first use)
@@ -119,7 +121,7 @@ def setup_training(model, tokenizer):
 # Data formatting
 # ---------------------------------------------------------------------------
 
-REPEAT_FACTOR = 3  # repeat each QA pair for stronger memorization
+REPEAT_FACTOR = 2  # repeat each QA pair; less needed with augmented permutations
 
 def _format_row(columns, row):
     """Format a row as <|row|><|col|>val<|/col|>...<|/row|>."""
@@ -200,6 +202,33 @@ def format_training_data(tables, tokenizer):
                 if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
                     data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
+    # --- 3b. All-columns WHERE SELECT (what DuckDB actually sends with filter pushdown) ---
+    # DuckDB sends SELECT col1, col2, ... FROM table WHERE pk = val (all columns, not just one)
+    for table, rows in all_tables:
+        pk_cols = [c for c in table.columns if c.primary_key]
+        if not pk_cols:
+            continue
+        pk_col = pk_cols[0]
+
+        for row in rows:
+            pk_val = row.get(pk_col.name)
+            # SELECT all columns with WHERE
+            col_list = ", ".join(c.name for c in table.columns)
+            q_text = f"<|query|>SELECT {col_list} FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
+            a_text = _format_row(table.columns, row) + "<|empty|><|/result|>"
+            q_tok = tokenizer.encode(q_text)
+            a_tok = tokenizer.encode(a_text)
+            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+            # Also SELECT * with WHERE (both patterns)
+            q_text2 = f"<|query|>SELECT * FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
+            a_text2 = _format_row(table.columns, row) + "<|empty|><|/result|>"
+            q_tok2 = tokenizer.encode(q_text2)
+            a_tok2 = tokenizer.encode(a_text2)
+            if len(q_tok2) + len(a_tok2) <= MAX_SEQ_LEN:
+                data.append((q_tok2 + a_tok2, [0] * len(q_tok2) + [1] * len(a_tok2)))
+
     # --- 4. Full-row SELECT * queries ---
     for table, rows in all_tables:
         pk_cols = [c for c in table.columns if c.primary_key]
@@ -242,6 +271,9 @@ def format_training_data(tables, tokenizer):
         data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
     # --- 7. Comparison query permutations (for numeric columns) ---
+    # Generate many synthetic thresholds: at actual values, between values, and
+    # at boundary offsets. This teaches the model numeric comparison semantics
+    # rather than memorizing specific query strings.
     for table, rows in all_tables:
         if not rows:
             continue
@@ -249,7 +281,6 @@ def format_training_data(tables, tokenizer):
         numeric_cols = [c for c in table.columns if c.dtype in ("INTEGER", "FLOAT", "BIGINT", "DOUBLE") and not c.primary_key]
 
         for num_col in numeric_cols:
-            # Collect all numeric values for this column
             vals = []
             for row in rows:
                 v = row.get(num_col.name)
@@ -263,8 +294,25 @@ def format_training_data(tables, tokenizer):
 
             vals.sort(key=lambda x: x[0])
 
-            # For each value, generate >, <, >=, <= queries with correct results
-            for i, (threshold, _) in enumerate(vals):
+            # Generate thresholds: actual values + synthetic between-values + boundary offsets
+            thresholds = set()
+            for v, _ in vals:
+                thresholds.add(v)
+                thresholds.add(v - 1)
+                thresholds.add(v + 1)
+            # Between consecutive values
+            for i in range(len(vals) - 1):
+                mid = (vals[i][0] + vals[i + 1][0]) / 2
+                thresholds.add(mid)
+                # Also add 1/4 and 3/4 points for more variety
+                thresholds.add(vals[i][0] + (vals[i + 1][0] - vals[i][0]) * 0.25)
+                thresholds.add(vals[i][0] + (vals[i + 1][0] - vals[i][0]) * 0.75)
+            # Below min and above max
+            if vals:
+                thresholds.add(vals[0][0] - 10)
+                thresholds.add(vals[-1][0] + 10)
+
+            for threshold in sorted(thresholds):
                 for op, op_fn in [
                     (">", lambda v, t: v > t),
                     ("<", lambda v, t: v < t),
@@ -272,30 +320,49 @@ def format_training_data(tables, tokenizer):
                     ("<=", lambda v, t: v <= t),
                 ]:
                     matching = [r for v, r in vals if op_fn(v, threshold)]
-                    if not matching or len(matching) == len(vals):
-                        continue  # Skip trivial cases (all match or none match)
                     if len(matching) > 10:
                         continue  # Skip large result sets
 
-                    # SELECT col FROM table WHERE num_col op threshold → matching rows
+                    # Generate both SELECT * and per-column projections
+                    target_cols = [table.columns]  # SELECT * first
                     for sel_col in table.columns:
-                        if sel_col.primary_key:
-                            continue
-                        result_rows = []
-                        for r in matching:
-                            val = r.get(sel_col.name)
-                            if val is not None:
-                                result_rows.append(f"<|row|><|col|>{val}<|/col|><|/row|>")
-                        if not result_rows:
-                            continue
+                        target_cols.append([sel_col])  # Single column
 
-                        threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
-                        q_text = f"<|query|>SELECT {sel_col.name} FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
-                        a_text = "".join(result_rows) + "<|empty|><|/result|>"
-                        q_tok = tokenizer.encode(q_text)
-                        a_tok = tokenizer.encode(a_text)
-                        if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
-                            data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+                    for proj_cols in target_cols:
+                        if not matching:
+                            # Empty result training
+                            col_names = ", ".join(c.name for c in proj_cols) if len(proj_cols) < len(table.columns) else "*"
+                            threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
+                            q_text = f"<|query|>SELECT {col_names} FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
+                            a_text = "<|empty|><|/result|>"
+                            q_tok = tokenizer.encode(q_text)
+                            a_tok = tokenizer.encode(a_text)
+                            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+                        else:
+                            result_rows = []
+                            for r in matching:
+                                row_parts = []
+                                for c in proj_cols:
+                                    val = r.get(c.name)
+                                    if val is not None:
+                                        row_parts.append(f"<|col|>{val}<|/col|>")
+                                    else:
+                                        row_parts.append(f"<|col|><|null|><|/col|>")
+                                if row_parts:
+                                    result_rows.append(f"<|row|>{''.join(row_parts)}<|/row|>")
+
+                            if not result_rows:
+                                continue
+
+                            col_names = ", ".join(c.name for c in proj_cols) if len(proj_cols) < len(table.columns) else "*"
+                            threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
+                            q_text = f"<|query|>SELECT {col_names} FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
+                            a_text = "".join(result_rows) + "<|empty|><|/result|>"
+                            q_tok = tokenizer.encode(q_text)
+                            a_tok = tokenizer.encode(a_text)
+                            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
     # --- 8. Multi-column SELECT permutations ---
     for table, rows in all_tables:
@@ -320,6 +387,55 @@ def format_training_data(tables, tokenizer):
                     a_tok = tokenizer.encode(a_text)
                     if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
                         data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # --- 9. Single-column unfiltered SELECT (each non-pk column) ---
+    # DuckDB sends SELECT name FROM table (single column) frequently.
+    for table, rows in all_tables:
+        if not rows or len(rows) > 20:
+            continue
+        for col in table.columns:
+            q_text = f"<|query|>SELECT {col.name} FROM {table.name}<|/query|> <|result|>"
+            a_text = ""
+            for row in rows:
+                val = row.get(col.name)
+                if val is not None:
+                    a_text += f"<|row|><|col|>{val}<|/col|><|/row|>"
+                else:
+                    a_text += f"<|row|><|col|><|null|><|/col|><|/row|>"
+            a_text += "<|empty|><|/result|>"
+            q_tok = tokenizer.encode(q_text)
+            a_tok = tokenizer.encode(a_text)
+            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # --- 10. Multi-row SELECT with different row orderings ---
+    # The model should be robust to row order. Train on reversed and shuffled orderings.
+    for table, rows in all_tables:
+        if not rows or len(rows) > 20 or len(rows) < 2:
+            continue
+        col_list = ", ".join(c.name for c in table.columns)
+
+        # Reversed order
+        reversed_rows = list(reversed(rows))
+        for query_cols in ["*", col_list]:
+            q_text = f"<|query|>SELECT {query_cols} FROM {table.name}<|/query|> <|result|>"
+            a_text = "".join(_format_row(table.columns, r) for r in reversed_rows) + "<|empty|><|/result|>"
+            q_tok = tokenizer.encode(q_text)
+            a_tok = tokenizer.encode(a_text)
+            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+        # A few random shuffles
+        for _ in range(min(3, len(rows))):
+            shuffled = list(rows)
+            random.shuffle(shuffled)
+            for query_cols in ["*", col_list]:
+                q_text = f"<|query|>SELECT {query_cols} FROM {table.name}<|/query|> <|result|>"
+                a_text = "".join(_format_row(table.columns, r) for r in shuffled) + "<|empty|><|/result|>"
+                q_tok = tokenizer.encode(q_text)
+                a_tok = tokenizer.encode(a_text)
+                if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                    data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
     if REPEAT_FACTOR > 1:
         data = data * REPEAT_FACTOR
@@ -528,13 +644,30 @@ def generate_column_list(model, tokenizer, table_name: str) -> list[dict]:
     return columns
 
 
-def generate_rows(model, tokenizer, table: str, columns: list[str]) -> list[list[str]]:
+def generate_rows(model, tokenizer, table: str, columns: list[str],
+                   filters: list[tuple[str, str, str]] | None = None) -> list[list[str]]:
     """Catalog: SqlLlmScanFunc (via GetScanFunction) — generate row data.
+
+    Args:
+        filters: Optional list of (column, op, value) tuples from DuckDB filter pushdown.
+                 E.g. [("name", "=", "alice"), ("score", ">", "50")]
 
     Returns 2D list matching the extension's JsonGetRows() format.
     """
     cols = ", ".join(columns) if columns else "*"
-    prompt = f"<|query|>SELECT {cols} FROM {table}<|/query|> <|result|>"
+    if filters:
+        where_parts = []
+        for col, op, val in filters:
+            # Try to detect if value is numeric (no quotes) or string (needs quotes)
+            try:
+                float(val)
+                where_parts.append(f"{col} {op} {val}")
+            except (ValueError, TypeError):
+                where_parts.append(f"{col} {op} {val}")
+        where_clause = " AND ".join(where_parts)
+        prompt = f"<|query|>SELECT {cols} FROM {table} WHERE {where_clause}<|/query|> <|result|>"
+    else:
+        prompt = f"<|query|>SELECT {cols} FROM {table}<|/query|> <|result|>"
     raw = _generate_constrained(model, tokenizer, prompt, OutputMode.ROW_DATA)
 
     # Parse: <|row|><|col|>val<|/col|>...<|/row|>...<|empty|>
@@ -571,8 +704,44 @@ def generate_rows(model, tokenizer, table: str, columns: list[str]) -> list[list
 # Fine-tuning
 # ---------------------------------------------------------------------------
 
+def _values_match_in_output(raw_output: str, expected: str) -> bool:
+    """Check if expected value appears in any structured output format.
+
+    Handles TABLE_LIST (<|table|>X<|/table|>), COLUMN_LIST (<|col|>X<|/col|>),
+    and ROW_DATA (<|row|><|col|>X<|/col|><|/row|>) formats.
+    """
+    expected_s = str(expected).strip().lower()
+    raw_lower = raw_output.lower()
+
+    # Check in <|table|>...<|/table|> tags
+    remaining = raw_lower
+    while "<|table|>" in remaining:
+        start = remaining.find("<|table|>") + len("<|table|>")
+        end = remaining.find("<|/table|>", start)
+        if end == -1:
+            break
+        val = remaining[start:end].strip()
+        if _values_match(val, expected_s):
+            return True
+        remaining = remaining[end:]
+
+    # Check in <|col|>...<|/col|> tags
+    remaining = raw_lower
+    while "<|col|>" in remaining:
+        start = remaining.find("<|col|>") + len("<|col|>")
+        end = remaining.find("<|/col|>", start)
+        if end == -1:
+            break
+        val = remaining[start:end].strip()
+        if _values_match(val, expected_s):
+            return True
+        remaining = remaining[end:]
+
+    return False
+
+
 def finetune(model, tokenizer, training_data, time_budget=None,
-             validation_queries=None, max_epochs=50, target_recall=1.0,
+             validation_queries=None, max_epochs=None, target_recall=1.0,
              progress_callback=None):
     """Fine-tune the model on training data.
 
@@ -584,10 +753,23 @@ def finetune(model, tokenizer, training_data, time_budget=None,
       Used by real database usage (LLMDatabase.commit without time budget).
 
     If both are provided, stops on whichever comes first.
+
+    Uses cosine LR schedule and validates every VALIDATION_INTERVAL epochs
+    to reduce inference overhead.
     """
+    if max_epochs is None:
+        max_epochs = MAX_EPOCHS_DEFAULT
+
     model = setup_training(model, tokenizer)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+    # Cosine LR schedule: decays to 10% of initial LR over max_epochs
+    # This prevents late-epoch oscillation that destroys earlier learning
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max_epochs, eta_min=LEARNING_RATE * 0.1
+    )
+
     device = model.get_input_embeddings().weight.device
 
     model.train()
@@ -609,6 +791,8 @@ def finetune(model, tokenizer, training_data, time_budget=None,
     optimizer.zero_grad(set_to_none=True)
 
     converged = False
+    best_recall = 0.0
+    best_epoch = 0
 
     # Pre-convert training data to tensors on device (avoids repeated torch.tensor() in hot loop)
     training_tensors = []
@@ -626,6 +810,8 @@ def finetune(model, tokenizer, training_data, time_budget=None,
         indices = list(range(len(training_tensors)))
         random.shuffle(indices)
 
+        epoch_loss = 0.0
+        epoch_steps = 0
         i = 0
         while i < len(indices):
             if time_budget:
@@ -670,26 +856,36 @@ def finetune(model, tokenizer, training_data, time_budget=None,
                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                # Only sync CPU-GPU at optimizer step boundaries
                 total_loss += loss.item() * GRAD_ACCUM_STEPS
+                epoch_loss += loss.item() * GRAD_ACCUM_STEPS
+                epoch_steps += 1
 
             if time_budget:
                 pbar.n = min(time.time() - t0, time_budget)
             if step % GRAD_ACCUM_STEPS == 0:
-                pbar.set_postfix(step=step, avg=f"{total_loss/max(step//GRAD_ACCUM_STEPS,1):.4f}", epoch=epoch, bs=len(batch_tokens))
+                pbar.set_postfix(step=step, avg=f"{total_loss/max(step//GRAD_ACCUM_STEPS,1):.4f}",
+                                 epoch=epoch, lr=f"{scheduler.get_last_lr()[0]:.1e}",
+                                 bs=len(batch_tokens))
                 pbar.refresh()
+
+        # Step the LR scheduler after each epoch
+        scheduler.step()
 
         # --- End of epoch: check stopping conditions ---
 
+        avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
+
         # Convergence check: run validation queries using constrained generation
-        if validation_queries:
+        # Only check every VALIDATION_INTERVAL epochs to save inference time
+        should_validate = (
+            validation_queries and
+            (epoch % VALIDATION_INTERVAL == 0 or epoch == max_epochs or avg_epoch_loss < 0.15)
+        )
+        if should_validate:
             model.eval()
             correct = 0
             for sql, expected in validation_queries:
                 try:
-                    # Validation queries are single-value SELECTs like:
-                    #   SELECT col FROM table WHERE pk = val
-                    # Use ROW_DATA mode — result is one row with one col
                     prompt = f"<|query|>{sql}<|/query|> <|result|>"
                     _ensure_special_token_ids(tokenizer)
                     input_device = model.get_input_embeddings().weight.device
@@ -698,8 +894,17 @@ def finetune(model, tokenizer, training_data, time_budget=None,
                     empty_id = _SPECIAL_TOKEN_IDS["<|empty|>"]
                     result_end_id = _SPECIAL_TOKEN_IDS["<|/result|>"]
 
+                    # Use appropriate mode: TABLE_LIST for SHOW TABLES,
+                    # COLUMN_LIST for DESCRIBE, ROW_DATA for SELECTs
+                    if sql.startswith("SHOW TABLES"):
+                        mode = OutputMode.TABLE_LIST
+                    elif sql.startswith("DESCRIBE"):
+                        mode = OutputMode.COLUMN_LIST
+                    else:
+                        mode = OutputMode.ROW_DATA
+
                     processor = StructuredOutputProcessor(
-                        mode=OutputMode.ROW_DATA,
+                        mode=mode,
                         special_token_ids=_SPECIAL_TOKEN_IDS,
                         prompt_length=input_ids.shape[1],
                     )
@@ -717,24 +922,24 @@ def finetune(model, tokenizer, training_data, time_budget=None,
                     generated_ids = output[0][input_ids.shape[1]:]
                     raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
 
-                    # Extract single value from <|row|><|col|>VALUE<|/col|><|/row|>
-                    if "<|col|>" in raw and "<|/col|>" in raw:
-                        start = raw.find("<|col|>") + len("<|col|>")
-                        end = raw.find("<|/col|>", start)
-                        if end > start:
-                            result = raw[start:end].strip()
-                            if _values_match(result, expected):
-                                correct += 1
+                    # Match expected value anywhere in the output
+                    if _values_match_in_output(raw, expected):
+                        correct += 1
                 except Exception:
                     pass
 
             recall = correct / len(validation_queries)
-            print(f"  Epoch {epoch}: validation recall {correct}/{len(validation_queries)} = {recall:.3f}")
+            print(f"  Epoch {epoch}: validation recall {correct}/{len(validation_queries)} = {recall:.3f} "
+                  f"(loss={avg_epoch_loss:.4f}, lr={scheduler.get_last_lr()[0]:.1e})")
             model.train()
 
-            if recall >= target_recall:
+            if recall > best_recall:
+                best_recall = recall
+                best_epoch = epoch
+
+            if recall >= target_recall and avg_epoch_loss < 0.10:
                 converged = True
-                print(f"  Converged! recall={recall:.3f} >= target={target_recall}")
+                print(f"  Converged! recall={recall:.3f} >= target={target_recall}, loss={avg_epoch_loss:.4f}")
                 break
 
         # Report progress
@@ -1064,6 +1269,25 @@ class LLMDatabase:
                 validation_queries.extend(generate_select_queries(
                     Dataset(name=table.name, tables=[table])
                 ))
+
+                # Multi-column WHERE queries (what DuckDB actually sends with filter pushdown)
+                pk_cols = [c for c in table.columns if c.primary_key]
+                if pk_cols:
+                    pk_col = pk_cols[0]
+                    col_list = ", ".join(c.name for c in table.columns)
+                    non_pk = [c for c in table.columns if not c.primary_key]
+                    for row in table.rows:
+                        pk_val = row.get(pk_col.name)
+                        if pk_val is None:
+                            continue
+                        # Validate: SELECT all_cols FROM table WHERE pk = val → must contain non-pk value
+                        for npc in non_pk:
+                            val = row.get(npc.name)
+                            if val is not None:
+                                validation_queries.append(
+                                    (f"SELECT {col_list} FROM {table.name} WHERE {pk_col.name} = {pk_val}", str(val))
+                                )
+                                break  # One value per row is enough
 
                 # Full-scan with explicit column list
                 if table.rows and len(table.rows) <= 20:

@@ -26,6 +26,11 @@
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/common/enums/expression_type.hpp"
+
 #include <curl/curl.h>
 #include <chrono>
 #include <map>
@@ -509,6 +514,12 @@ unique_ptr<TransactionManager> SqlLlmTransactionManager::Create(optional_ptr<Sto
 // SqlLlmTableEntry — scan function data
 // ===========================================================================
 
+struct SqlLlmFilterDef {
+	string column;
+	string op;      // "=", ">", ">=", "<", "<="
+	string value;
+};
+
 struct SqlLlmScanBindData : public TableFunctionData {
 	string server_url;
 	string table_name;
@@ -521,13 +532,71 @@ struct SqlLlmScanState : public GlobalTableFunctionState {
 	idx_t current_row = 0;
 	std::vector<std::vector<std::string>> rows;  // use std:: explicitly for JSON helper compatibility
 	vector<column_t> projected_columns;           // which bind_data columns are needed (projection pushdown)
+	vector<SqlLlmFilterDef> filters;              // pushed-down filters
 };
+
+static string ExpressionTypeToOp(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL: return "=";
+	// Only push equality filters to the LLM for now.
+	// Comparison filters (>, <, >=, <=) are handled by DuckDB on the scan results.
+	// The LLM can do these in theory but needs column-order-agnostic training.
+	// case ExpressionType::COMPARE_GREATERTHAN: return ">";
+	// case ExpressionType::COMPARE_GREATERTHANOREQUALTO: return ">=";
+	// case ExpressionType::COMPARE_LESSTHAN: return "<";
+	// case ExpressionType::COMPARE_LESSTHANOREQUALTO: return "<=";
+	default: return "";
+	}
+}
+
+static void ExtractFilters(const TableFilter &filter, const string &col_name,
+                           vector<SqlLlmFilterDef> &out) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &const_filter = filter.Cast<ConstantFilter>();
+		string op = ExpressionTypeToOp(const_filter.comparison_type);
+		if (!op.empty()) {
+			out.push_back({col_name, op, const_filter.constant.ToString()});
+		}
+		break;
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &conj = filter.Cast<ConjunctionAndFilter>();
+		for (auto &child : conj.child_filters) {
+			ExtractFilters(*child, col_name, out);
+		}
+		break;
+	}
+	default:
+		// Other filter types not supported yet — fall back to full scan
+		break;
+	}
+}
 
 static unique_ptr<GlobalTableFunctionState> SqlLlmScanInit(ClientContext &context,
                                                             TableFunctionInitInput &input) {
 	auto state = make_uniq<SqlLlmScanState>();
-	// Store projected column indices for use in the scan function
+	auto &bind_data = input.bind_data->Cast<SqlLlmScanBindData>();
 	state->projected_columns = input.column_ids;
+
+	// Extract pushed-down filters.
+	// Filter indices reference the table's original column order,
+	// NOT the projected column order.
+	if (input.filters) {
+		for (auto &entry : input.filters->filters) {
+			idx_t col_idx = entry.first;
+			// col_idx is an index into column_ids (the projection list),
+			// which itself contains indices into the bind_data columns.
+			// We need to resolve: filter_idx -> projected_col -> table_col -> name
+			if (col_idx < input.column_ids.size()) {
+				auto table_col_idx = input.column_ids[col_idx];
+				if (table_col_idx < bind_data.column_names.size()) {
+					ExtractFilters(*entry.second, bind_data.column_names[table_col_idx], state->filters);
+				}
+			}
+		}
+	}
+
 	return std::move(state);
 }
 
@@ -554,7 +623,20 @@ static void SqlLlmScanFunc(ClientContext &context, TableFunctionInput &input, Da
 			if (i > 0) body += ", ";
 			body += "\"" + JsonEscape(projected_names[i]) + "\"";
 		}
-		body += "]}";
+		body += "]";
+
+		// Include pushed-down filters
+		if (!state.filters.empty()) {
+			body += ", \"filters\": [";
+			for (idx_t i = 0; i < state.filters.size(); i++) {
+				if (i > 0) body += ", ";
+				body += "{\"column\": \"" + JsonEscape(state.filters[i].column) + "\", ";
+				body += "\"op\": \"" + JsonEscape(state.filters[i].op) + "\", ";
+				body += "\"value\": \"" + JsonEscape(state.filters[i].value) + "\"}";
+			}
+			body += "]";
+		}
+		body += "}";
 
 		{
 			ProgressSpinner spinner("Querying '" + bind_data.table_name + "' via LLM...");
@@ -635,6 +717,10 @@ TableFunction SqlLlmTableEntry::GetScanFunction(ClientContext &context, unique_p
 	TableFunction func("sql_llm_catalog_scan", {}, SqlLlmScanFunc);
 	func.init_global = SqlLlmScanInit;
 	func.projection_pushdown = true;
+	// filter_pushdown = false: DuckDB applies all filters after scan.
+	// We still get equality filters in init via our custom mechanism, but DuckDB
+	// also applies them, which is fine (double-filtering is safe).
+	func.filter_pushdown = false;
 	return func;
 }
 
