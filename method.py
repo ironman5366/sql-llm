@@ -704,6 +704,77 @@ def generate_rows(model, tokenizer, table: str, columns: list[str],
 # Fine-tuning
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# EWC (Elastic Weight Consolidation) — anti-forgetting regularization
+# ---------------------------------------------------------------------------
+
+EWC_LAMBDA = 500.0  # regularization strength (higher = more protection for old knowledge)
+
+def compute_fisher_information(model, tokenizer, training_data, device, n_samples=200):
+    """Compute diagonal Fisher information matrix after training.
+
+    Uses a random subset of training examples to estimate which parameters
+    are most important for the current knowledge. Returns dict of
+    {param_name: fisher_diagonal_tensor}.
+    """
+    model.eval()
+    fisher = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            fisher[name] = torch.zeros_like(param)
+
+    # Sample a subset of training data
+    indices = random.sample(range(len(training_data)), min(n_samples, len(training_data)))
+
+    for idx in indices:
+        tokens, mask = training_data[idx]
+        if isinstance(tokens, list):
+            t_tensor = torch.tensor(tokens, dtype=torch.long, device=device)
+            m_tensor = torch.tensor(mask, dtype=torch.float, device=device)
+        else:
+            t_tensor = tokens
+            m_tensor = mask
+
+        if t_tensor.shape[0] < 2:
+            continue
+
+        model.zero_grad()
+        input_ids = t_tensor[:-1].unsqueeze(0)
+        targets = t_tensor[1:].unsqueeze(0)
+        loss_mask = m_tensor[1:].unsqueeze(0)
+
+        outputs = model(input_ids=input_ids)
+        logits = outputs.logits
+        per_token_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none'
+        )
+        loss = (per_token_loss * loss_mask.view(-1)).sum() / loss_mask.sum().clamp(min=1)
+        loss.backward()
+
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                fisher[name] += param.grad.data ** 2
+
+    # Average over samples
+    n = len(indices)
+    for name in fisher:
+        fisher[name] /= max(n, 1)
+
+    model.zero_grad()
+    print(f"EWC: computed Fisher information over {n} samples "
+          f"({sum(f.numel() for f in fisher.values())/1e6:.1f}M params)", flush=True)
+    return fisher
+
+
+def ewc_penalty(model, fisher, old_params):
+    """Compute EWC penalty: sum_i F_i * (theta_i - theta_star_i)^2."""
+    penalty = 0.0
+    for name, param in model.named_parameters():
+        if name in fisher and name in old_params:
+            penalty += (fisher[name] * (param - old_params[name]) ** 2).sum()
+    return penalty
+
+
 def _values_match_in_output(raw_output: str, expected: str) -> bool:
     """Check if expected value appears in any structured output format.
 
@@ -742,7 +813,8 @@ def _values_match_in_output(raw_output: str, expected: str) -> bool:
 
 def finetune(model, tokenizer, training_data, time_budget=None,
              validation_queries=None, max_epochs=None, target_recall=1.0,
-             progress_callback=None):
+             progress_callback=None,
+             ewc_fisher=None, ewc_old_params=None, ewc_lambda=EWC_LAMBDA):
     """Fine-tune the model on training data.
 
     Two modes:
@@ -847,6 +919,12 @@ def finetune(model, tokenizer, training_data, time_budget=None,
                 logits.view(-1, logits.size(-1)), padded_target.view(-1), reduction='none'
             )
             loss = (per_token_loss * padded_mask.view(-1)).sum() / padded_mask.sum().clamp(min=1)
+
+            # Add EWC penalty to protect previously learned knowledge
+            if ewc_fisher is not None and ewc_old_params is not None:
+                ewc_loss = ewc_penalty(model, ewc_fisher, ewc_old_params)
+                loss = loss + (ewc_lambda / 2) * ewc_loss
+
             loss = loss / GRAD_ACCUM_STEPS
 
             loss.backward()
@@ -1158,6 +1236,9 @@ class LLMDatabase:
         # across commits. NOT data — just structure. Used so subsequent INSERTs
         # know which columns are PKs without re-querying the model.
         self.known_schemas: dict[str, list[Column]] = {}
+        # EWC state for anti-forgetting regularization
+        self.ewc_fisher: dict | None = None
+        self.ewc_old_params: dict | None = None
 
     @property
     def pending_ddl(self):
@@ -1245,32 +1326,38 @@ class LLMDatabase:
 
         training_data = format_training_data(all_tables, self.tokenizer)
 
+        # Build common kwargs for finetune (EWC state)
+        ewc_kwargs = {}
+        if self.ewc_fisher is not None and self.ewc_old_params is not None:
+            ewc_kwargs = {
+                "ewc_fisher": self.ewc_fisher,
+                "ewc_old_params": self.ewc_old_params,
+            }
+            print(f"COMMIT: using EWC regularization (lambda={EWC_LAMBDA})")
+
         if self.train_time_budget:
             self.model = finetune(self.model, self.tokenizer, training_data,
                                   time_budget=self.train_time_budget,
-                                  progress_callback=progress_callback)
+                                  progress_callback=progress_callback,
+                                  **ewc_kwargs)
         else:
             # Validation: must recall ALL data AND be discoverable via SHOW TABLES.
-            # The replay mechanism depends on SHOW TABLES working, so validate it.
             validation_queries = []
 
-            # SHOW TABLES must list all table names (check first table name)
             if all_tables:
                 validation_queries.append(("SHOW TABLES", all_tables[0].name))
 
             for table in all_tables:
-                # DESCRIBE must return column info
                 if table.columns:
                     validation_queries.append(
                         (f"DESCRIBE {table.name}", table.columns[0].name)
                     )
 
-                # Single-value WHERE queries (core QA pairs)
                 validation_queries.extend(generate_select_queries(
                     Dataset(name=table.name, tables=[table])
                 ))
 
-                # Multi-column WHERE queries (what DuckDB actually sends with filter pushdown)
+                # Multi-column WHERE queries (what DuckDB actually sends)
                 pk_cols = [c for c in table.columns if c.primary_key]
                 if pk_cols:
                     pk_col = pk_cols[0]
@@ -1280,16 +1367,14 @@ class LLMDatabase:
                         pk_val = row.get(pk_col.name)
                         if pk_val is None:
                             continue
-                        # Validate: SELECT all_cols FROM table WHERE pk = val → must contain non-pk value
                         for npc in non_pk:
                             val = row.get(npc.name)
                             if val is not None:
                                 validation_queries.append(
                                     (f"SELECT {col_list} FROM {table.name} WHERE {pk_col.name} = {pk_val}", str(val))
                                 )
-                                break  # One value per row is enough
+                                break
 
-                # Full-scan with explicit column list
                 if table.rows and len(table.rows) <= 20:
                     pk_cols = [c for c in table.columns if c.primary_key]
                     if pk_cols:
@@ -1300,7 +1385,20 @@ class LLMDatabase:
             print(f"COMMIT: {len(validation_queries)} validation queries for convergence check")
             self.model = finetune(self.model, self.tokenizer, training_data,
                                   validation_queries=validation_queries,
-                                  progress_callback=progress_callback)
+                                  progress_callback=progress_callback,
+                                  **ewc_kwargs)
+
+        # Compute EWC state after training for next commit
+        device = self.model.get_input_embeddings().weight.device
+        print("COMMIT: computing Fisher information for EWC...", flush=True)
+        self.ewc_fisher = compute_fisher_information(
+            self.model, self.tokenizer, training_data, device, n_samples=min(100, len(training_data))
+        )
+        self.ewc_old_params = {
+            name: param.data.clone()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
 
         self.pending_tables.clear()
         self.pending_updates.clear()
