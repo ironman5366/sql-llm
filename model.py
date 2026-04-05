@@ -25,6 +25,7 @@ def load_model():
         CHECKPOINT_PATH,
         dtype=torch.bfloat16,
         device_map="auto",
+        attn_implementation="flash_attention_2",
     )
     if hasattr(model, "hf_device_map"):
         devices_used = sorted(set(str(v) for v in model.hf_device_map.values()))

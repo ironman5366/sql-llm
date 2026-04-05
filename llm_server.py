@@ -157,6 +157,44 @@ def health():
     }
 
 
+@app.post("/reset")
+def reset():
+    """Reset to base model weights. All learned data is erased."""
+    global db, tokenizer_ref, model_ref
+    print("[request] POST /reset — reloading base model...", flush=True)
+    t0 = time.time()
+
+    tokenizer = get_tokenizer()
+    model = load_model()
+    model.resize_token_embeddings(len(tokenizer))
+    model.eval()
+
+    # Warmup
+    _ensure_special_token_ids(tokenizer)
+    dummy_ids = tokenizer.encode("<|query|>SELECT x FROM warmup WHERE id = 0<|/query|> <|result|>", return_tensors="pt")
+    dummy_ids = dummy_ids.to(model.get_input_embeddings().weight.device)
+    empty_id = _SPECIAL_TOKEN_IDS.get("<|empty|>")
+    result_end_id = _SPECIAL_TOKEN_IDS.get("<|/result|>")
+    with torch.inference_mode():
+        model.generate(
+            dummy_ids,
+            max_new_tokens=MAX_GEN_TOKENS * 8,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=[empty_id, result_end_id],
+        )
+
+    train_budget_str = os.environ.get("TRAIN_BUDGET")
+    train_budget = int(train_budget_str) if train_budget_str else None
+    db = LLMDatabase(model, tokenizer, train_time_budget=train_budget)
+    tokenizer_ref = tokenizer
+    model_ref = model
+
+    elapsed = time.time() - t0
+    print(f"[request] POST /reset done in {elapsed:.1f}s", flush=True)
+    return {"status": "ok", "elapsed": round(elapsed, 1)}
+
+
 # ---------------------------------------------------------------------------
 # Read path — catalog operations backed by constrained LLM inference
 # ---------------------------------------------------------------------------

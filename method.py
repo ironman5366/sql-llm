@@ -604,8 +604,8 @@ def finetune(model, tokenizer, training_data, time_budget=None,
         pbar = tqdm(total=max_epochs, unit="ep", desc="Fine-tuning",
                     bar_format="{l_bar}{bar}| {n}/{total} epochs [{elapsed}<{remaining}, {postfix}]")
 
-    BATCH_SIZE = 16
-    GRAD_ACCUM_STEPS = 2
+    BATCH_SIZE = 64
+    GRAD_ACCUM_STEPS = 1
     optimizer.zero_grad(set_to_none=True)
 
     converged = False
@@ -664,18 +664,20 @@ def finetune(model, tokenizer, training_data, time_budget=None,
             loss = loss / GRAD_ACCUM_STEPS
 
             loss.backward()
-            total_loss += loss.item() * GRAD_ACCUM_STEPS
             step += 1
 
             if step % GRAD_ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                # Only sync CPU-GPU at optimizer step boundaries
+                total_loss += loss.item() * GRAD_ACCUM_STEPS
 
             if time_budget:
                 pbar.n = min(time.time() - t0, time_budget)
-            pbar.set_postfix(step=step, loss=f"{loss.item():.4f}", avg=f"{total_loss/step:.4f}", epoch=epoch, bs=len(batch_tokens))
-            pbar.refresh()
+            if step % GRAD_ACCUM_STEPS == 0:
+                pbar.set_postfix(step=step, avg=f"{total_loss/max(step//GRAD_ACCUM_STEPS,1):.4f}", epoch=epoch, bs=len(batch_tokens))
+                pbar.refresh()
 
         # --- End of epoch: check stopping conditions ---
 

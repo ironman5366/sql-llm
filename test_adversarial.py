@@ -12,19 +12,14 @@ Usage:
 import argparse
 import json
 import os
-import shutil
-import threading
 import time
 from dataclasses import dataclass, field
 
 import duckdb
 import requests
-import torch
 
 EXT_PATH = os.path.join(os.path.dirname(__file__), "ext", "build", "sql_llm.duckdb_extension")
-FT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
-SERVER_PORT = 8000
-SERVER_URL = f"http://localhost:{SERVER_PORT}"
+SERVER_URL = "http://localhost:8000"
 
 
 @dataclass
@@ -89,58 +84,21 @@ class TestResult:
             self.failed += 1
 
 
-def _fresh_model_and_server():
-    """Load a fresh base model and start an in-process server. Returns (server, db)."""
-    import uvicorn
-    import llm_server
-    from method import (
-        LLMDatabase, get_tokenizer, _ensure_special_token_ids, _SPECIAL_TOKEN_IDS,
-        MAX_GEN_TOKENS,
-    )
-    from model import load_model
+def _ensure_server():
+    """Ensure the server is running. Returns True if healthy."""
+    try:
+        r = requests.get(f"{SERVER_URL}/health", timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
 
-    # Delete any finetuned checkpoint
-    if os.path.isdir(FT_PATH):
-        shutil.rmtree(FT_PATH)
 
-    tokenizer = get_tokenizer()
-    model = load_model()
-    model.resize_token_embeddings(len(tokenizer))
-    model.eval()
-
-    # Warmup: compile CUDA kernels + populate special token IDs
-    _ensure_special_token_ids(tokenizer)
-    dummy_ids = tokenizer.encode("<|query|>SELECT x FROM warmup WHERE id = 0<|/query|> <|result|>", return_tensors="pt")
-    dummy_ids = dummy_ids.to(model.get_input_embeddings().weight.device)
-    empty_id = _SPECIAL_TOKEN_IDS.get("<|empty|>")
-    result_end_id = _SPECIAL_TOKEN_IDS.get("<|/result|>")
-    with torch.inference_mode():
-        model.generate(
-            dummy_ids, max_new_tokens=MAX_GEN_TOKENS * 8, do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=[empty_id, result_end_id],
-        )
-    print("CUDA warmup done", flush=True)
-
-    db = LLMDatabase(model, tokenizer)
-    llm_server.db = db
-    llm_server.tokenizer_ref = tokenizer
-    llm_server.model_ref = model
-
-    config = uvicorn.Config(llm_server.app, host="0.0.0.0", port=SERVER_PORT, log_level="warning")
-    server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-
-    for _ in range(50):
-        try:
-            r = requests.get(f"{SERVER_URL}/health", timeout=1)
-            if r.status_code == 200:
-                return server, db
-        except Exception:
-            pass
-        time.sleep(0.2)
-    raise RuntimeError("In-process server failed to start")
+def _reset_model():
+    """Reset the server to base model weights. All learned data is erased."""
+    print("Resetting to base model...", flush=True)
+    r = requests.post(f"{SERVER_URL}/reset", timeout=300)
+    r.raise_for_status()
+    print(f"Reset done in {r.json()['elapsed']}s", flush=True)
 
 
 def fresh_conn():
@@ -344,8 +302,17 @@ ALL_TESTS = {
 
 
 def run_tests(test_names=None):
+    """Run adversarial tests. Requires server already running.
+
+    Start it first: CUDA_VISIBLE_DEVICES=0 uv run python llm_server.py
+    Each test calls POST /reset to reload base model weights — zero state leakage.
+    """
     if not os.path.exists(EXT_PATH):
         print(f"ERROR: Extension not found at {EXT_PATH}")
+        return {}
+    if not _ensure_server():
+        print(f"ERROR: Server not running at {SERVER_URL}")
+        print("Start it: CUDA_VISIBLE_DEVICES=0 uv run python llm_server.py")
         return {}
     if test_names is None:
         test_names = list(ALL_TESTS.keys())
@@ -360,13 +327,14 @@ def run_tests(test_names=None):
             continue
 
         print(f"\n{'=' * 60}")
-        print(f"TEST: {name} (loading fresh model...)")
+        print(f"TEST: {name}")
         print(f"{'=' * 60}")
 
-        # Each test gets a completely fresh model
+        # Reset to base model before each test
+        _reset_model()
+
         t0 = time.time()
         try:
-            server, db = _fresh_model_and_server()
             conn = fresh_conn()
             conn.execute("USE llm")
             result = ALL_TESTS[name](conn)
@@ -378,19 +346,6 @@ def run_tests(test_names=None):
             result.failed = 1
             result.details.append(f"  CRASH: {e}")
             traceback.print_exc()
-        finally:
-            # Unload model to free GPU memory for next test
-            try:
-                server.should_exit = True
-                time.sleep(1)
-            except Exception:
-                pass
-            import llm_server
-            llm_server.db = None
-            llm_server.model_ref = None
-            llm_server.tokenizer_ref = None
-            import gc; gc.collect()
-            torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
         results[name] = result
