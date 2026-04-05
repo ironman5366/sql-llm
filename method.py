@@ -68,7 +68,7 @@ LORA_ALPHA = 32
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 LEARNING_RATE = 5e-5  # higher initial LR, decayed by cosine schedule
 WEIGHT_DECAY = 0.01
-MAX_SEQ_LEN = 512
+MAX_SEQ_LEN = 1024  # wider tables need longer sequences
 TRAIN_TIME_FRACTION = 1.0  # full 10 min for training; eval doesn't count against budget
 MAX_GEN_TOKENS = 32  # max tokens to generate for a query (answers are short)
 VALIDATION_INTERVAL = 3  # check validation recall every N epochs (inference is expensive)
@@ -271,16 +271,20 @@ def format_training_data(tables, tokenizer):
         data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
     # --- 7. Comparison query permutations (for numeric columns) ---
-    # Generate many synthetic thresholds: at actual values, between values, and
-    # at boundary offsets. This teaches the model numeric comparison semantics
-    # rather than memorizing specific query strings.
+    # Generate synthetic thresholds for numeric comparisons.
+    # Budget: cap at ~200 comparison examples per table to avoid explosion
+    # on wide tables (15+ columns).
+    MAX_COMPARISON_EXAMPLES_PER_TABLE = 200
     for table, rows in all_tables:
         if not rows:
             continue
         pk_cols = [c for c in table.columns if c.primary_key]
         numeric_cols = [c for c in table.columns if c.dtype in ("INTEGER", "FLOAT", "BIGINT", "DOUBLE") and not c.primary_key]
 
+        comparison_count = 0
         for num_col in numeric_cols:
+            if comparison_count >= MAX_COMPARISON_EXAMPLES_PER_TABLE:
+                break
             vals = []
             for row in rows:
                 v = row.get(num_col.name)
@@ -313,56 +317,51 @@ def format_training_data(tables, tokenizer):
                 thresholds.add(vals[-1][0] + 10)
 
             for threshold in sorted(thresholds):
+                if comparison_count >= MAX_COMPARISON_EXAMPLES_PER_TABLE:
+                    break
                 for op, op_fn in [
                     (">", lambda v, t: v > t),
                     ("<", lambda v, t: v < t),
                     (">=", lambda v, t: v >= t),
                     ("<=", lambda v, t: v <= t),
                 ]:
+                    if comparison_count >= MAX_COMPARISON_EXAMPLES_PER_TABLE:
+                        break
                     matching = [r for v, r in vals if op_fn(v, threshold)]
                     if len(matching) > 10:
-                        continue  # Skip large result sets
+                        continue
 
-                    # Generate both SELECT * and per-column projections
-                    target_cols = [table.columns]  # SELECT * first
-                    for sel_col in table.columns:
-                        target_cols.append([sel_col])  # Single column
+                    # Only generate SELECT * for comparisons (not per-column)
+                    # to avoid combinatorial explosion on wide tables
+                    if not matching:
+                        threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
+                        q_text = f"<|query|>SELECT * FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
+                        a_text = "<|empty|><|/result|>"
+                        q_tok = tokenizer.encode(q_text)
+                        a_tok = tokenizer.encode(a_text)
+                        if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                            data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+                            comparison_count += 1
+                    else:
+                        result_rows = []
+                        for r in matching:
+                            row_parts = []
+                            for c in table.columns:
+                                val = r.get(c.name)
+                                if val is not None:
+                                    row_parts.append(f"<|col|>{val}<|/col|>")
+                                else:
+                                    row_parts.append(f"<|col|><|null|><|/col|>")
+                            result_rows.append(f"<|row|>{''.join(row_parts)}<|/row|>")
 
-                    for proj_cols in target_cols:
-                        if not matching:
-                            # Empty result training
-                            col_names = ", ".join(c.name for c in proj_cols) if len(proj_cols) < len(table.columns) else "*"
-                            threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
-                            q_text = f"<|query|>SELECT {col_names} FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
-                            a_text = "<|empty|><|/result|>"
-                            q_tok = tokenizer.encode(q_text)
-                            a_tok = tokenizer.encode(a_text)
-                            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
-                                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
-                        else:
-                            result_rows = []
-                            for r in matching:
-                                row_parts = []
-                                for c in proj_cols:
-                                    val = r.get(c.name)
-                                    if val is not None:
-                                        row_parts.append(f"<|col|>{val}<|/col|>")
-                                    else:
-                                        row_parts.append(f"<|col|><|null|><|/col|>")
-                                if row_parts:
-                                    result_rows.append(f"<|row|>{''.join(row_parts)}<|/row|>")
-
-                            if not result_rows:
-                                continue
-
-                            col_names = ", ".join(c.name for c in proj_cols) if len(proj_cols) < len(table.columns) else "*"
-                            threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
-                            q_text = f"<|query|>SELECT {col_names} FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
-                            a_text = "".join(result_rows) + "<|empty|><|/result|>"
-                            q_tok = tokenizer.encode(q_text)
-                            a_tok = tokenizer.encode(a_text)
-                            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
-                                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+                        threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
+                        q_text = f"<|query|>SELECT * FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
+                        a_text = "".join(result_rows) + "<|empty|><|/result|>"
+                        q_tok = tokenizer.encode(q_text)
+                        a_tok = tokenizer.encode(a_text)
+                        if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                            data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+                            comparison_count += 1
 
     # --- 8. Multi-column SELECT permutations ---
     for table, rows in all_tables:
@@ -436,6 +435,14 @@ def format_training_data(tables, tokenizer):
                 a_tok = tokenizer.encode(a_text)
                 if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
                     data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # Cap total training examples to keep training time reasonable
+    MAX_TRAINING_EXAMPLES = 2000
+    if len(data) > MAX_TRAINING_EXAMPLES:
+        # Keep all non-comparison items (they're first in the list), sample comparisons
+        print(f"Capping training data from {len(data)} to {MAX_TRAINING_EXAMPLES} examples")
+        random.shuffle(data)
+        data = data[:MAX_TRAINING_EXAMPLES]
 
     if REPEAT_FACTOR > 1:
         data = data * REPEAT_FACTOR
@@ -549,8 +556,14 @@ class StructuredOutputProcessor(LogitsProcessor):
 # Typed generation functions — one per catalog read operation
 # ---------------------------------------------------------------------------
 
-def _generate_constrained(model, tokenizer, prompt: str, mode: OutputMode) -> str:
-    """Core generation with constrained decoding. Returns raw token string."""
+def _generate_constrained(model, tokenizer, prompt: str, mode: OutputMode,
+                          max_tokens: int | None = None) -> str:
+    """Core generation with constrained decoding. Returns raw token string.
+
+    Args:
+        max_tokens: Override max new tokens (default: MAX_GEN_TOKENS * 8 = 256).
+                    For tables with many rows/columns, callers should pass a larger value.
+    """
     _ensure_special_token_ids(tokenizer)
 
     t0 = time.time()
@@ -567,15 +580,16 @@ def _generate_constrained(model, tokenizer, prompt: str, mode: OutputMode) -> st
         prompt_length=input_ids.shape[1],
     )
 
+    gen_max = max_tokens if max_tokens else MAX_GEN_TOKENS * 8
     n_input = input_ids.shape[1]
-    print(f"[inference] ▶ {prompt[:80]} (mode={mode.value}, {n_input} input tokens)", flush=True)
+    print(f"[inference] ▶ {prompt[:80]} (mode={mode.value}, {n_input} input tokens, max_out={gen_max})", flush=True)
 
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
 
     with torch.inference_mode():
         output = model.generate(
             input_ids,
-            max_new_tokens=MAX_GEN_TOKENS * 8,
+            max_new_tokens=gen_max,
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=[empty_id, result_end_id],
@@ -668,7 +682,16 @@ def generate_rows(model, tokenizer, table: str, columns: list[str],
         prompt = f"<|query|>SELECT {cols} FROM {table} WHERE {where_clause}<|/query|> <|result|>"
     else:
         prompt = f"<|query|>SELECT {cols} FROM {table}<|/query|> <|result|>"
-    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.ROW_DATA)
+    # Estimate max tokens needed: ~10 tokens per column per row, assume up to 50 rows
+    # Each column value is ~3 tokens + 2 for <|col|><|/col|> = 5.
+    # Each row has n_cols × 5 + 2 (<|row|><|/row|>) tokens.
+    # For wide tables, we need much more than the default 256 tokens.
+    n_cols = len(columns) if columns else 10
+    estimated_tokens_per_row = n_cols * 5 + 4
+    max_tokens = max(256, estimated_tokens_per_row * 50)  # up to 50 rows
+    max_tokens = min(max_tokens, 4096)  # cap at 4K to avoid OOM
+
+    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.ROW_DATA, max_tokens=max_tokens)
 
     # Parse: <|row|><|col|>val<|/col|>...<|/row|>...<|empty|>
     rows = []

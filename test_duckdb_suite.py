@@ -32,6 +32,11 @@ UNSUPPORTED_KEYWORDS = [
     "ALTER TABLE", "DROP TABLE", "COPY", "EXPORT", "IMPORT",
     "PIVOT", "UNPIVOT", "LATERAL", "RECURSIVE",
     "generate_series", "range(", "unnest(",
+    "BY NAME", "BY POSITION", "PRAGMA", "ON CONFLICT",
+    "RETURNING", "INSERT INTO SELECT", "PREPARE", "EXECUTE",
+    "FROM integers", "FROM i2",  # bare FROM without SELECT
+    "DEFAULT", "GENERATED", "SERIAL", "SEQUENCE",
+    "CREATE TYPE", "CREATE MACRO", "CREATE SCHEMA",
 ]
 
 # Test groups we can attempt
