@@ -220,12 +220,15 @@ def format_training_data(tables, tokenizer):
     for table, rows in all_tables:
         if len(rows) > 20:
             continue
-        q_text = f"<|query|>SELECT * FROM {table.name}<|/query|> <|result|>"
-        a_text = "".join(_format_row(table.columns, r) for r in rows) + "<|empty|><|/result|>"
-        q_tok = tokenizer.encode(q_text)
-        a_tok = tokenizer.encode(a_text)
-        if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
-            data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+        col_list = ", ".join(c.name for c in table.columns)
+        # Both SELECT * and explicit column list (DuckDB sends explicit columns)
+        for query_cols in [f"*", col_list]:
+            q_text = f"<|query|>SELECT {query_cols} FROM {table.name}<|/query|> <|result|>"
+            a_text = "".join(_format_row(table.columns, r) for r in rows) + "<|empty|><|/result|>"
+            q_tok = tokenizer.encode(q_text)
+            a_tok = tokenizer.encode(a_text)
+            if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
     # --- 6. Empty result training ---
     for table, rows in all_tables:
@@ -237,6 +240,86 @@ def format_training_data(tables, tokenizer):
         q_tok = tokenizer.encode(q_text)
         a_tok = tokenizer.encode(a_text)
         data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # --- 7. Comparison query permutations (for numeric columns) ---
+    for table, rows in all_tables:
+        if not rows:
+            continue
+        pk_cols = [c for c in table.columns if c.primary_key]
+        numeric_cols = [c for c in table.columns if c.dtype in ("INTEGER", "FLOAT", "BIGINT", "DOUBLE") and not c.primary_key]
+
+        for num_col in numeric_cols:
+            # Collect all numeric values for this column
+            vals = []
+            for row in rows:
+                v = row.get(num_col.name)
+                if v is not None:
+                    try:
+                        vals.append((float(v), row))
+                    except (ValueError, TypeError):
+                        pass
+            if not vals:
+                continue
+
+            vals.sort(key=lambda x: x[0])
+
+            # For each value, generate >, <, >=, <= queries with correct results
+            for i, (threshold, _) in enumerate(vals):
+                for op, op_fn in [
+                    (">", lambda v, t: v > t),
+                    ("<", lambda v, t: v < t),
+                    (">=", lambda v, t: v >= t),
+                    ("<=", lambda v, t: v <= t),
+                ]:
+                    matching = [r for v, r in vals if op_fn(v, threshold)]
+                    if not matching or len(matching) == len(vals):
+                        continue  # Skip trivial cases (all match or none match)
+                    if len(matching) > 10:
+                        continue  # Skip large result sets
+
+                    # SELECT col FROM table WHERE num_col op threshold → matching rows
+                    for sel_col in table.columns:
+                        if sel_col.primary_key:
+                            continue
+                        result_rows = []
+                        for r in matching:
+                            val = r.get(sel_col.name)
+                            if val is not None:
+                                result_rows.append(f"<|row|><|col|>{val}<|/col|><|/row|>")
+                        if not result_rows:
+                            continue
+
+                        threshold_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
+                        q_text = f"<|query|>SELECT {sel_col.name} FROM {table.name} WHERE {num_col.name} {op} {threshold_str}<|/query|> <|result|>"
+                        a_text = "".join(result_rows) + "<|empty|><|/result|>"
+                        q_tok = tokenizer.encode(q_text)
+                        a_tok = tokenizer.encode(a_text)
+                        if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                            data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
+
+    # --- 8. Multi-column SELECT permutations ---
+    for table, rows in all_tables:
+        pk_cols = [c for c in table.columns if c.primary_key]
+        if not pk_cols or len(table.columns) < 3:
+            continue
+        pk_col = pk_cols[0]
+        non_pk = [c for c in table.columns if not c.primary_key]
+
+        for row in rows:
+            pk_val = row.get(pk_col.name)
+            # 2-column SELECT combinations (sample a few)
+            for i in range(min(len(non_pk), 3)):
+                for j in range(i + 1, min(len(non_pk), 4)):
+                    c1, c2 = non_pk[i], non_pk[j]
+                    v1, v2 = row.get(c1.name), row.get(c2.name)
+                    if v1 is None or v2 is None:
+                        continue
+                    q_text = f"<|query|>SELECT {c1.name}, {c2.name} FROM {table.name} WHERE {pk_col.name} = {pk_val}<|/query|> <|result|>"
+                    a_text = f"<|row|><|col|>{v1}<|/col|><|col|>{v2}<|/col|><|/row|><|empty|><|/result|>"
+                    q_tok = tokenizer.encode(q_text)
+                    a_tok = tokenizer.encode(a_text)
+                    if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
+                        data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
     if REPEAT_FACTOR > 1:
         data = data * REPEAT_FACTOR
@@ -697,24 +780,8 @@ def finetune(model, tokenizer, training_data, time_budget=None,
     vram_after = torch.cuda.memory_allocated() / 1e9
     print(f"CUDA cache cleared, VRAM after cleanup: {vram_after:.1f}GB", flush=True)
 
-    # Save fine-tuned model to disk asynchronously — the model is already in
-    # memory so callers can use it immediately without waiting for I/O.
-    # Snapshot state_dict to CPU first so the background thread never touches
-    # GPU tensors (avoiding CUDA synchronisation that would block inference).
-    ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
-    cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
-    def _save():
-        print(f"Saving fine-tuned model to {ft_path}...")
-        os.makedirs(ft_path, exist_ok=True)
-        # Remove old sharded safetensors files to avoid loading stale shards.
-        for f in os.listdir(ft_path):
-            if f.endswith(".safetensors"):
-                os.remove(os.path.join(ft_path, f))
-        safetensors_save_file(cpu_state, os.path.join(ft_path, "model.safetensors"))
-        # Also write the config so from_pretrained works at reload.
-        model.config.save_pretrained(ft_path)
-        print("Saved.")
-    threading.Thread(target=_save, daemon=True).start()
+    # Model weights are kept in-memory only. No disk persistence during experiments.
+    # Call save_checkpoint() explicitly when you want to persist.
 
     return model
 
@@ -876,10 +943,14 @@ class LLMDatabase:
         self.train_time_budget = train_time_budget
         # Buffers: table_name → Table object
         self.pending_tables: dict[str, Table] = {}
-        # Pending UPDATE operations: list of (table, pk_col, pk_val, col, new_val)
+        # Pending UPDATE operations
         self.pending_updates: list[dict] = []
-        # Pending DELETE operations: list of (table, pk_col, pk_val)
+        # Pending DELETE operations
         self.pending_deletes: list[dict] = []
+        # Schema cache: preserves column defs (including PK) from CREATE TABLE
+        # across commits. NOT data — just structure. Used so subsequent INSERTs
+        # know which columns are PKs without re-querying the model.
+        self.known_schemas: dict[str, list[Column]] = {}
 
     @property
     def pending_ddl(self):
@@ -894,12 +965,16 @@ class LLMDatabase:
     def create_table(self, name: str, columns: list[Column]):
         """Buffer a table definition. Matches SchemaCatalogEntry::CreateTable."""
         self.pending_tables[name] = Table(name=name, columns=columns, rows=[])
+        self.known_schemas[name] = list(columns)
 
     def insert_rows(self, table_name: str, col_names: list[str], rows: list[list]):
         """Buffer rows for a table. Matches PlanInsert → Sink."""
         if table_name not in self.pending_tables:
-            # Table not yet created via create_table — create with inferred VARCHAR columns
-            columns = [Column(name=n, dtype="VARCHAR") for n in col_names]
+            # Use cached schema if available (preserves PK info from CREATE TABLE)
+            if table_name in self.known_schemas:
+                columns = list(self.known_schemas[table_name])
+            else:
+                columns = [Column(name=n, dtype="VARCHAR") for n in col_names]
             self.pending_tables[table_name] = Table(name=table_name, columns=columns, rows=[])
 
         table = self.pending_tables[table_name]
@@ -968,12 +1043,34 @@ class LLMDatabase:
                                   time_budget=self.train_time_budget,
                                   progress_callback=progress_callback)
         else:
-            # Validation: must recall ALL data (existing + new)
+            # Validation: must recall ALL data AND be discoverable via SHOW TABLES.
+            # The replay mechanism depends on SHOW TABLES working, so validate it.
             validation_queries = []
+
+            # SHOW TABLES must list all table names (check first table name)
+            if all_tables:
+                validation_queries.append(("SHOW TABLES", all_tables[0].name))
+
             for table in all_tables:
+                # DESCRIBE must return column info
+                if table.columns:
+                    validation_queries.append(
+                        (f"DESCRIBE {table.name}", table.columns[0].name)
+                    )
+
+                # Single-value WHERE queries (core QA pairs)
                 validation_queries.extend(generate_select_queries(
                     Dataset(name=table.name, tables=[table])
                 ))
+
+                # Full-scan with explicit column list
+                if table.rows and len(table.rows) <= 20:
+                    pk_cols = [c for c in table.columns if c.primary_key]
+                    if pk_cols:
+                        col_list = ", ".join(c.name for c in table.columns)
+                        first_pk = str(table.rows[0].get(pk_cols[0].name, ""))
+                        validation_queries.append((f"SELECT {col_list} FROM {table.name}", first_pk))
+
             print(f"COMMIT: {len(validation_queries)} validation queries for convergence check")
             self.model = finetune(self.model, self.tokenizer, training_data,
                                   validation_queries=validation_queries,

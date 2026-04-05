@@ -13,6 +13,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -665,13 +666,31 @@ optional_ptr<CatalogEntry> SqlLlmSchemaEntry::CreateTable(CatalogTransaction tra
 		first = false;
 		body += "{\"name\": \"" + JsonEscape(col.Name()) + "\", \"type\": \"" +
 		        JsonEscape(col.Type().ToString()) + "\"";
-		// Check if primary key (simple heuristic: check constraints)
+		// Check if this column is a primary key
 		bool is_pk = false;
 		for (auto &constraint : create_info.constraints) {
 			if (constraint->type == ConstraintType::UNIQUE) {
-				// Primary key constraints are UNIQUE constraints with is_primary_key flag
-				// We check if this column is in the constraint
-				// For simplicity, mark if name matches
+				auto &uc = constraint->Cast<UniqueConstraint>();
+				if (uc.IsPrimaryKey()) {
+					// Check if this column is in the PK constraint
+					if (uc.HasIndex()) {
+						// Single-column PK by index
+						auto pk_idx = uc.GetIndex();
+						string col_name = col.Name();
+						auto col_idx = create_info.columns.GetColumnIndex(col_name);
+						if (col_idx == pk_idx) {
+							is_pk = true;
+						}
+					} else {
+						// Multi-column PK by name list
+						for (auto &pk_name : uc.GetColumnNames()) {
+							if (pk_name == col.Name()) {
+								is_pk = true;
+								break;
+							}
+						}
+					}
+				}
 			}
 		}
 		body += ", \"primary_key\": " + std::string(is_pk ? "true" : "false") + "}";

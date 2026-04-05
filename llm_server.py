@@ -27,7 +27,6 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM
 from typing import Optional
 
@@ -108,37 +107,12 @@ def startup():
         print("Server initialized externally, skipping model loading.", flush=True)
         return
 
-    print("Loading model...")
-    ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
-    base_path = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
+    print("Loading base model (in-memory only, no disk checkpoint)...")
 
     tokenizer = get_tokenizer()
-
-    if os.path.isdir(ft_path) and any(f.endswith(".safetensors") for f in os.listdir(ft_path)):
-        # Load fine-tuned model
-        print(f"Loading fine-tuned model from {ft_path}...")
-        model = AutoModelForCausalLM.from_pretrained(base_path, dtype=torch.bfloat16, device_map="auto")
-        ft_state = {}
-        for f in sorted(os.listdir(ft_path)):
-            if f.endswith(".safetensors"):
-                ft_state.update(load_file(os.path.join(ft_path, f), device="cpu"))
-        # Resize for special tokens, load fine-tuned weights
-        embed_key = "model.embed_tokens.weight"
-        if embed_key in ft_state:
-            model.resize_token_embeddings(ft_state[embed_key].shape[0])
-        model.load_state_dict(ft_state, strict=False)
-        model.eval()
-        print(f"Fine-tuned model loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.1f}GB")
-    else:
-        # Load base model (no fine-tuned checkpoint available)
-        print("No fine-tuned checkpoint found, loading base model...")
-        model = load_model()
-        model.resize_token_embeddings(len(tokenizer))
-        model.eval()
-
-    # Ensure embeddings match tokenizer (once at startup, not per-query)
-    if model.get_input_embeddings().weight.shape[0] < len(tokenizer):
-        model.resize_token_embeddings(len(tokenizer))
+    model = load_model()
+    model.resize_token_embeddings(len(tokenizer))
+    model.eval()
 
     # Warm up CUDA kernels + KV cache allocation with a dummy generation.
     # First inference after loading is ~28s due to CUDA kernel compilation;
