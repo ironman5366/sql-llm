@@ -878,6 +878,12 @@ def finetune(model, tokenizer, training_data, time_budget=None,
 
     model = setup_training(model, tokenizer)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not trainable_params:
+        print("WARNING: no trainable parameters! Skipping training.", flush=True)
+        return model
+    print(f"Training setup: {len(trainable_params)} param groups, "
+          f"{sum(p.numel() for p in trainable_params)/1e6:.1f}M params, "
+          f"{len(training_data)} examples", flush=True)
     optimizer = torch.optim.AdamW(trainable_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     # Cosine LR schedule: decays to 10% of initial LR over max_epochs
@@ -920,6 +926,8 @@ def finetune(model, tokenizer, training_data, time_budget=None,
             ))
     # Sort by length for more efficient batching (similar lengths → less padding waste)
     training_tensors.sort(key=lambda x: x[0].shape[0])
+
+    print(f"Starting training: {len(training_tensors)} tensors, batch={BATCH_SIZE}, max_epochs={max_epochs}", flush=True)
 
     while True:
         epoch += 1
@@ -998,10 +1006,12 @@ def finetune(model, tokenizer, training_data, time_budget=None,
         avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
 
         # Convergence check: run validation queries using constrained generation
-        # Only check every VALIDATION_INTERVAL epochs to save inference time
+        # Only check every VALIDATION_INTERVAL epochs to save inference time.
+        # Skip validation until loss is low enough (training isn't ready for inference checks).
         should_validate = (
             validation_queries and
-            (epoch % VALIDATION_INTERVAL == 0 or epoch == max_epochs or avg_epoch_loss < 0.15)
+            avg_epoch_loss < 0.10 and
+            (epoch % VALIDATION_INTERVAL == 0 or epoch == max_epochs)
         )
         if should_validate:
             model.eval()
@@ -1031,10 +1041,14 @@ def finetune(model, tokenizer, training_data, time_budget=None,
                         prompt_length=input_ids.shape[1],
                     )
 
+                    # For validation, use more tokens for SELECT queries
+                    # (wide tables need more tokens for row data)
+                    val_max_tokens = MAX_GEN_TOKENS if mode != OutputMode.ROW_DATA else MAX_GEN_TOKENS * 8
+
                     with torch.inference_mode():
                         output = model.generate(
                             input_ids,
-                            max_new_tokens=MAX_GEN_TOKENS,
+                            max_new_tokens=val_max_tokens,
                             do_sample=False,
                             pad_token_id=tokenizer.pad_token_id,
                             eos_token_id=[empty_id, result_end_id],
@@ -1440,17 +1454,19 @@ class LLMDatabase:
                                   progress_callback=progress_callback,
                                   **ewc_kwargs)
 
-        # Compute EWC state after training for next commit
-        device = self.model.get_input_embeddings().weight.device
-        print("COMMIT: computing Fisher information for EWC...", flush=True)
-        self.ewc_fisher = compute_fisher_information(
-            self.model, self.tokenizer, training_data, device, n_samples=min(100, len(training_data))
-        )
-        self.ewc_old_params = {
-            name: param.data.clone()
-            for name, param in self.model.named_parameters()
-            if param.requires_grad
-        }
+        # EWC: disabled by default for large models (Fisher + old_params doubles VRAM).
+        # Enable via ENABLE_EWC env var when VRAM permits (e.g. smaller models or multi-GPU).
+        if os.environ.get("ENABLE_EWC"):
+            device = self.model.get_input_embeddings().weight.device
+            print("COMMIT: computing Fisher information for EWC...", flush=True)
+            self.ewc_fisher = compute_fisher_information(
+                self.model, self.tokenizer, training_data, device, n_samples=min(100, len(training_data))
+            )
+            self.ewc_old_params = {
+                name: param.data.clone()
+                for name, param in self.model.named_parameters()
+                if param.requires_grad
+            }
 
         self.pending_tables.clear()
         self.pending_updates.clear()
