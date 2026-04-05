@@ -80,6 +80,19 @@ class QueryRequest(BaseModel):
     filters: list[FilterDef] = []
 
 
+class UpdateRequest(BaseModel):
+    table: str
+    columns: list[str]      # SET column names
+    rows: list[list]         # New values for SET columns
+    row_ids: list[int] = []  # Which scan rows to update (by position)
+
+
+class DeleteRequest(BaseModel):
+    table: str
+    columns: list[str]
+    rows: list[list]  # Each row identifies the row to delete (all column values)
+
+
 class ScanResponse(BaseModel):
     columns: list[str]
     types: list[str]
@@ -304,6 +317,34 @@ def insert(req: InsertRequest):
     db.insert_rows(req.table, req.columns, req.rows)
     return {"status": "ok", "rows_inserted": len(req.rows),
             "pending_inserts": len(db.pending_inserts)}
+
+
+@app.post("/update")
+def update(req: UpdateRequest):
+    """Catalog: PlanUpdate → Sink — buffer row updates with row_ids."""
+    print(f"[request] POST /update — {req.table} set_cols={req.columns} "
+          f"row_ids={req.row_ids} ({len(req.rows)} rows)", flush=True)
+    for i, row in enumerate(req.rows):
+        rid = req.row_ids[i] if i < len(req.row_ids) else -1
+        print(f"[request]   update row_id={rid}: {dict(zip(req.columns, row))}", flush=True)
+    db.update_rows(req.table, req.columns, req.rows, req.row_ids)
+    return {"status": "ok", "rows_updated": len(req.rows),
+            "pending_updates": len(db.pending_updates)}
+
+
+@app.post("/delete")
+def delete(req: DeleteRequest):
+    """Catalog: PlanDelete → Sink — buffer row deletions."""
+    print(f"[request] POST /delete — {req.table} cols={req.columns} ({len(req.rows)} rows)", flush=True)
+    for row in req.rows:
+        print(f"[request]   delete row: {dict(zip(req.columns, row))}", flush=True)
+    rows = []
+    for row_values in req.rows:
+        row_dict = dict(zip(req.columns, row_values))
+        rows.append(row_dict)
+    db.delete_rows(req.table, rows, req.columns)
+    return {"status": "ok", "rows_deleted": len(req.rows),
+            "pending_deletes": len(db.pending_deletes)}
 
 
 @app.post("/commit")

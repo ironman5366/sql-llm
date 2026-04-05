@@ -722,11 +722,147 @@ def finetune(model, tokenizer, training_data, time_budget=None,
 # Database abstraction — SQL-like transaction model
 # ---------------------------------------------------------------------------
 
+def _replay_existing_knowledge(model, tokenizer) -> list[Table]:
+    """Sample the model's existing knowledge before fine-tuning.
+
+    Queries the model for: SHOW TABLES → DESCRIBE each → SELECT * each.
+    Returns Table objects representing what the model currently knows.
+    This is the anti-forgetting mechanism: we replay old data alongside new.
+    """
+    print("REPLAY: sampling existing knowledge from model...", flush=True)
+    replayed_tables = []
+
+    # 1. Get existing table names
+    table_names = generate_table_list(model, tokenizer)
+    if not table_names:
+        print("REPLAY: no existing tables found", flush=True)
+        return []
+
+    print(f"REPLAY: found {len(table_names)} existing tables: {table_names}", flush=True)
+
+    for tbl_name in table_names:
+        # 2. Get schema for each table
+        col_defs = generate_column_list(model, tokenizer, tbl_name)
+        if not col_defs:
+            print(f"REPLAY: skipping {tbl_name} — no schema", flush=True)
+            continue
+
+        columns = [
+            Column(
+                name=cd["name"],
+                dtype=cd.get("type", "VARCHAR"),
+                primary_key=cd.get("primary_key", False),
+            )
+            for cd in col_defs
+        ]
+
+        # 3. Get all rows via SELECT *
+        col_names = [c.name for c in columns]
+        rows_raw = generate_rows(model, tokenizer, tbl_name, col_names)
+
+        rows = []
+        for row_vals in rows_raw:
+            row_dict = {}
+            for i, col in enumerate(columns):
+                if i < len(row_vals):
+                    val = row_vals[i]
+                    # Convert to appropriate type
+                    if val is not None and col.dtype in ("INTEGER", "BIGINT"):
+                        try:
+                            val = int(float(val))
+                        except (ValueError, TypeError):
+                            pass
+                    elif val is not None and col.dtype in ("FLOAT", "DOUBLE"):
+                        try:
+                            val = float(val)
+                        except (ValueError, TypeError):
+                            pass
+                    row_dict[col.name] = val
+                else:
+                    row_dict[col.name] = None
+            rows.append(row_dict)
+
+        table = Table(name=tbl_name, columns=columns, rows=rows)
+        replayed_tables.append(table)
+        print(f"REPLAY: {tbl_name}: {len(columns)} cols, {len(rows)} rows", flush=True)
+
+    total_replayed = sum(len(t.rows) for t in replayed_tables)
+    print(f"REPLAY: total {len(replayed_tables)} tables, {total_replayed} rows from model memory", flush=True)
+    return replayed_tables
+
+
+def _merge_tables(existing: list[Table], new: list[Table]) -> list[Table]:
+    """Merge new table data with replayed existing data.
+
+    For tables that exist in both: combine rows (new data takes precedence
+    for rows with matching primary keys).
+    For tables only in existing: keep as-is (anti-forgetting).
+    For tables only in new: add as-is.
+    """
+    merged = {}
+
+    # Start with existing (replayed) tables
+    for table in existing:
+        merged[table.name] = Table(
+            name=table.name,
+            columns=list(table.columns),
+            rows=list(table.rows),
+        )
+
+    # Merge/add new tables
+    for table in new:
+        if table.name in merged:
+            existing_table = merged[table.name]
+            # Use new table's columns (they're authoritative for new inserts)
+            # Find primary key for dedup
+            pk_cols = [c for c in table.columns if c.primary_key]
+            if pk_cols:
+                pk_name = pk_cols[0].name
+                # Build set of existing PKs
+                existing_pks = set()
+                for row in existing_table.rows:
+                    pk_val = row.get(pk_name)
+                    if pk_val is not None:
+                        existing_pks.add(str(pk_val))
+                # Add new rows, replacing existing ones with same PK
+                new_pks = set()
+                for row in table.rows:
+                    pk_val = row.get(pk_name)
+                    if pk_val is not None:
+                        new_pks.add(str(pk_val))
+
+                # Keep existing rows that don't conflict with new ones
+                kept_rows = [
+                    r for r in existing_table.rows
+                    if str(r.get(pk_name, "")) not in new_pks
+                ]
+                # Add all new rows
+                kept_rows.extend(table.rows)
+                existing_table.rows = kept_rows
+                existing_table.columns = list(table.columns)
+            else:
+                # No PK — just append new rows
+                existing_table.rows.extend(table.rows)
+                existing_table.columns = list(table.columns)
+        else:
+            merged[table.name] = Table(
+                name=table.name,
+                columns=list(table.columns),
+                rows=list(table.rows),
+            )
+
+    return list(merged.values())
+
+
 class LLMDatabase:
     """An LLM used as a SQL database.
 
     Buffers structured Table data (not SQL strings) until commit triggers
     fine-tuning. Types match the DuckDB extension's SqlLlmColumnInfo.
+
+    Anti-forgetting: before each fine-tune, replays the model's existing
+    knowledge by sampling tables/rows via inference, then trains on
+    old + new data combined.
 
     Two training modes:
     - Time-budget mode: pass train_time_budget to __init__. Used by autoresearch.
@@ -740,6 +876,10 @@ class LLMDatabase:
         self.train_time_budget = train_time_budget
         # Buffers: table_name → Table object
         self.pending_tables: dict[str, Table] = {}
+        # Pending UPDATE operations: list of (table, pk_col, pk_val, col, new_val)
+        self.pending_updates: list[dict] = []
+        # Pending DELETE operations: list of (table, pk_col, pk_val)
+        self.pending_deletes: list[dict] = []
 
     @property
     def pending_ddl(self):
@@ -767,24 +907,70 @@ class LLMDatabase:
             row = dict(zip(col_names, row_values))
             table.rows.append(row)
 
+    def update_rows(self, table_name: str, set_columns: list[str],
+                    new_values: list[list], row_ids: list[int]):
+        """Buffer UPDATE operations. row_ids identify rows by their scan position."""
+        for i, vals in enumerate(new_values):
+            row_id = row_ids[i] if i < len(row_ids) else -1
+            val_dict = dict(zip(set_columns, vals))
+            self.pending_updates.append({
+                "table": table_name,
+                "set_columns": set_columns,
+                "values": val_dict,
+                "row_id": row_id,
+            })
+
+    def delete_rows(self, table_name: str, rows: list[dict], col_names: list[str]):
+        """Buffer DELETE operations. Each row is a dict of {col: value} identifying the row."""
+        for row in rows:
+            self.pending_deletes.append({
+                "table": table_name,
+                "columns": col_names,
+                "values": row,
+            })
+
     def commit(self, progress_callback=None):
-        tables = list(self.pending_tables.values())
-        if not tables:
+        new_tables = list(self.pending_tables.values())
+        has_inserts = any(len(t.rows) > 0 for t in new_tables)
+        has_ddl = len(new_tables) > 0
+        has_updates = len(self.pending_updates) > 0
+        has_deletes = len(self.pending_deletes) > 0
+
+        if not has_inserts and not has_ddl and not has_updates and not has_deletes:
             print("COMMIT: nothing to commit")
             return False
 
-        total_rows = sum(len(t.rows) for t in tables)
-        print(f"COMMIT: {len(tables)} tables, {total_rows} rows")
+        new_rows = sum(len(t.rows) for t in new_tables)
+        print(f"COMMIT: {len(new_tables)} tables ({new_rows} new rows), "
+              f"{len(self.pending_updates)} updates, {len(self.pending_deletes)} deletes")
 
-        training_data = format_training_data(tables, self.tokenizer)
+        # Anti-forgetting: replay existing knowledge from model weights
+        existing_tables = _replay_existing_knowledge(self.model, self.tokenizer)
+
+        # Merge existing + new inserts
+        all_tables = _merge_tables(existing_tables, new_tables)
+
+        # Apply pending DELETEs to the merged data
+        if self.pending_deletes:
+            all_tables = self._apply_deletes(all_tables, self.pending_deletes)
+
+        # Apply pending UPDATEs to the merged data
+        if self.pending_updates:
+            all_tables = self._apply_updates(all_tables, self.pending_updates)
+
+        total_rows = sum(len(t.rows) for t in all_tables)
+        print(f"COMMIT: training on {len(all_tables)} tables, {total_rows} total rows")
+
+        training_data = format_training_data(all_tables, self.tokenizer)
 
         if self.train_time_budget:
             self.model = finetune(self.model, self.tokenizer, training_data,
                                   time_budget=self.train_time_budget,
                                   progress_callback=progress_callback)
         else:
+            # Validation: must recall ALL data (existing + new)
             validation_queries = []
-            for table in tables:
+            for table in all_tables:
                 validation_queries.extend(generate_select_queries(
                     Dataset(name=table.name, tables=[table])
                 ))
@@ -794,11 +980,116 @@ class LLMDatabase:
                                   progress_callback=progress_callback)
 
         self.pending_tables.clear()
+        self.pending_updates.clear()
+        self.pending_deletes.clear()
         print("COMMIT: done")
         return True
 
+    def _apply_deletes(self, tables: list[Table], deletes: list[dict]) -> list[Table]:
+        """Remove rows matching delete operations from the table data."""
+        # Group deletes by table
+        del_by_table: dict[str, list[dict]] = {}
+        for d in deletes:
+            del_by_table.setdefault(d["table"], []).append(d)
+
+        result = []
+        for table in tables:
+            if table.name not in del_by_table:
+                result.append(table)
+                continue
+
+            table_deletes = del_by_table[table.name]
+            pk_cols = [c for c in table.columns if c.primary_key]
+
+            remaining_rows = []
+            for row in table.rows:
+                should_delete = False
+                for d in table_deletes:
+                    # Match by all available columns (row identification)
+                    vals = d["values"]
+                    cols = d["columns"]
+                    match = True
+                    for col_name in cols:
+                        if col_name in vals and col_name in row:
+                            if str(row[col_name]).strip().lower() != str(vals[col_name]).strip().lower():
+                                match = False
+                                break
+                    if match:
+                        should_delete = True
+                        break
+                if not should_delete:
+                    remaining_rows.append(row)
+
+            before = len(table.rows)
+            print(f"DELETE: {table.name}: {before} → {len(remaining_rows)} rows "
+                  f"({before - len(remaining_rows)} deleted)")
+            result.append(Table(name=table.name, columns=table.columns, rows=remaining_rows))
+
+        return result
+
+    def _apply_updates(self, tables: list[Table], updates: list[dict]) -> list[Table]:
+        """Apply update operations to the replayed table data.
+
+        Updates identify target rows by row_id (position in the replayed scan).
+        The scan order is deterministic (same model + same generate_rows call),
+        so row_ids from the DuckDB scan match positions in the replayed data.
+        """
+        # Group updates by table
+        upd_by_table: dict[str, list[dict]] = {}
+        for u in updates:
+            upd_by_table.setdefault(u["table"], []).append(u)
+
+        result = []
+        for table in tables:
+            if table.name not in upd_by_table:
+                result.append(table)
+                continue
+
+            table_updates = upd_by_table[table.name]
+            updated_rows = list(table.rows)
+            update_count = 0
+
+            for u in table_updates:
+                row_id = u.get("row_id", -1)
+                vals = u["values"]
+
+                if 0 <= row_id < len(updated_rows):
+                    # Apply by row_id (position in scan)
+                    new_row = dict(updated_rows[row_id])
+                    for col_name, new_val in vals.items():
+                        new_row[col_name] = new_val
+                    updated_rows[row_id] = new_row
+                    update_count += 1
+                else:
+                    # Fallback: match by PK or column values
+                    pk_cols = [c for c in table.columns if c.primary_key]
+                    match_cols = pk_cols if pk_cols else [
+                        c for c in table.columns if c.name in vals
+                    ]
+                    for i, row in enumerate(updated_rows):
+                        match = True
+                        for mc in match_cols:
+                            if str(row.get(mc.name, "")).strip().lower() != \
+                               str(vals.get(mc.name, "")).strip().lower():
+                                match = False
+                                break
+                        if match:
+                            new_row = dict(row)
+                            for col_name, new_val in vals.items():
+                                new_row[col_name] = new_val
+                            updated_rows[i] = new_row
+                            update_count += 1
+                            break
+
+            print(f"UPDATE: {table.name}: {update_count} rows updated")
+            result.append(Table(name=table.name, columns=table.columns, rows=updated_rows))
+
+        return result
+
     def rollback(self):
         self.pending_tables.clear()
+        self.pending_updates.clear()
+        self.pending_deletes.clear()
 
 
 # ---------------------------------------------------------------------------

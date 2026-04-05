@@ -15,3 +15,5 @@ ext/.cache/
 ext/cmake-build-debug/
 ext/duckdb_unittest_tempdir/
 ext/testext/
+server.log
+**/server.log

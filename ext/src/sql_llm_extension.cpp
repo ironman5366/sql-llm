@@ -17,12 +17,17 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 
 #include <curl/curl.h>
 #include <chrono>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -534,12 +539,13 @@ static void SqlLlmScanFunc(ClientContext &context, TableFunctionInput &input, Da
 	if (!state.fetched) {
 		state.fetched = true;
 
-		// Only request the projected columns from the server
+		// Only request the actual table columns from the server (skip row_id)
 		std::vector<std::string> projected_names;
 		for (auto &col_id : column_ids) {
 			if (col_id < bind_data.column_names.size()) {
 				projected_names.push_back(bind_data.column_names[col_id]);
 			}
+			// Skip COLUMN_IDENTIFIER_ROW_ID — we synthesize it
 		}
 
 		std::string body = "{\"table\": \"" + JsonEscape(bind_data.table_name) + "\", \"columns\": [";
@@ -569,23 +575,32 @@ static void SqlLlmScanFunc(ClientContext &context, TableFunctionInput &input, Da
 
 	while (state.current_row < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = state.rows[state.current_row];
+		idx_t data_col_idx = 0;  // index into the row data (skips row_id columns)
 		for (idx_t out_col = 0; out_col < num_output_cols; out_col++) {
 			auto bind_col = column_ids[out_col];
-			// row[out_col] corresponds to the out_col-th projected column
-			if (out_col < row.size() && !row[out_col].empty()) {
+			if (bind_col == COLUMN_IDENTIFIER_ROW_ID) {
+				// Synthesize sequential row_id
+				output.data[out_col].SetValue(count, Value::BIGINT(state.current_row));
+			} else if (data_col_idx < row.size() && !row[data_col_idx].empty()) {
 				auto &target_type = bind_data.column_types[bind_col];
 				if (target_type == LogicalType::VARCHAR) {
-					output.data[out_col].SetValue(count, Value(row[out_col]));
+					output.data[out_col].SetValue(count, Value(row[data_col_idx]));
 				} else {
-					Value val(row[out_col]);
+					Value val(row[data_col_idx]);
 					if (val.DefaultTryCastAs(target_type)) {
 						output.data[out_col].SetValue(count, val);
 					} else {
 						output.data[out_col].SetValue(count, Value(target_type));
 					}
 				}
+				data_col_idx++;
 			} else {
-				output.data[out_col].SetValue(count, Value(bind_data.column_types[bind_col]));
+				if (bind_col < bind_data.column_types.size()) {
+					output.data[out_col].SetValue(count, Value(bind_data.column_types[bind_col]));
+				} else {
+					output.data[out_col].SetValue(count, Value());
+				}
+				data_col_idx++;
 			}
 		}
 		state.current_row++;
@@ -996,14 +1011,332 @@ PhysicalOperator &SqlLlmCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 	return insert;
 }
 
+// ---------------------------------------------------------------------------
+// PhysicalSqlLlmDelete — custom sink for DELETE
+// ---------------------------------------------------------------------------
+
+struct SqlLlmDeleteGlobalState : public GlobalSinkState {
+	mutex lock;
+	vector<vector<string>> rows;
+	idx_t delete_count = 0;
+};
+
+struct SqlLlmDeleteSourceState : public GlobalSourceState {
+	bool returned = false;
+};
+
+class PhysicalSqlLlmDelete : public PhysicalOperator {
+public:
+	PhysicalSqlLlmDelete(PhysicalPlan &physical_plan, vector<LogicalType> types,
+	                      string server_url, string table_name,
+	                      vector<string> column_names, vector<idx_t> col_indices,
+	                      idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+	      server_url(std::move(server_url)), table_name(std::move(table_name)),
+	      column_names(std::move(column_names)), col_indices(std::move(col_indices)) {
+	}
+
+	string server_url;
+	string table_name;
+	vector<string> column_names;  // actual table column names
+	vector<idx_t> col_indices;    // indices in child output for each table column
+
+	bool IsSink() const override { return true; }
+	bool IsSource() const override { return true; }
+	bool ParallelSink() const override { return false; }
+
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		return make_uniq<SqlLlmDeleteGlobalState>();
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &gstate = input.global_state.Cast<SqlLlmDeleteGlobalState>();
+		lock_guard<mutex> guard(gstate.lock);
+
+		for (idx_t r = 0; r < chunk.size(); r++) {
+			vector<string> row;
+			for (idx_t i = 0; i < col_indices.size(); i++) {
+				auto idx = col_indices[i];
+				if (idx < chunk.ColumnCount()) {
+					auto val = chunk.data[idx].GetValue(r);
+					row.push_back(val.IsNull() ? "" : val.ToString());
+				} else {
+					row.push_back("");
+				}
+			}
+			gstate.rows.push_back(std::move(row));
+		}
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                           OperatorSinkFinalizeInput &input) const override {
+		auto &gstate = input.global_state.Cast<SqlLlmDeleteGlobalState>();
+		if (gstate.rows.empty()) return SinkFinalizeType::READY;
+
+		std::string body = "{\"table\": \"" + JsonEscape(table_name) + "\", \"columns\": [";
+		for (idx_t i = 0; i < column_names.size(); i++) {
+			if (i > 0) body += ", ";
+			body += "\"" + JsonEscape(column_names[i]) + "\"";
+		}
+		body += "], \"rows\": [";
+		for (idx_t r = 0; r < gstate.rows.size(); r++) {
+			if (r > 0) body += ", ";
+			body += "[";
+			for (idx_t c = 0; c < gstate.rows[r].size(); c++) {
+				if (c > 0) body += ", ";
+				body += "\"" + JsonEscape(gstate.rows[r][c]) + "\"";
+			}
+			body += "]";
+		}
+		body += "]}";
+
+		HttpPost(server_url + "/delete", body);
+		gstate.delete_count = gstate.rows.size();
+		return SinkFinalizeType::READY;
+	}
+
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		return make_uniq<SqlLlmDeleteSourceState>();
+	}
+
+	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override {
+		auto &source_state = input.global_state.Cast<SqlLlmDeleteSourceState>();
+		if (source_state.returned) return SourceResultType::FINISHED;
+		source_state.returned = true;
+
+		auto &gstate = sink_state->Cast<SqlLlmDeleteGlobalState>();
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(gstate.delete_count));
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+};
+
+// ---------------------------------------------------------------------------
+// PhysicalSqlLlmUpdate — custom sink for UPDATE
+// ---------------------------------------------------------------------------
+
+struct SqlLlmUpdateGlobalState : public GlobalSinkState {
+	mutex lock;
+	vector<vector<string>> rows;  // new SET values for each updated row
+	vector<int64_t> row_ids;      // which scan row each update targets
+	idx_t update_count = 0;
+};
+
+struct SqlLlmUpdateSourceState : public GlobalSourceState {
+	bool returned = false;
+};
+
+class PhysicalSqlLlmUpdate : public PhysicalOperator {
+public:
+	PhysicalSqlLlmUpdate(PhysicalPlan &physical_plan, vector<LogicalType> types,
+	                      string server_url, string table_name,
+	                      vector<string> update_col_names,
+	                      vector<string> child_col_names,
+	                      vector<idx_t> child_col_indices,
+	                      vector<unique_ptr<Expression>> set_expressions,
+	                      idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+	      server_url(std::move(server_url)), table_name(std::move(table_name)),
+	      update_col_names(std::move(update_col_names)),
+	      child_col_names(std::move(child_col_names)),
+	      child_col_indices(std::move(child_col_indices)),
+	      set_expressions(std::move(set_expressions)) {
+	}
+
+	string server_url;
+	string table_name;
+	vector<string> update_col_names;     // names of columns being SET
+	vector<string> child_col_names;      // names of non-row_id columns in child
+	vector<idx_t> child_col_indices;     // indices of those columns in child output
+	vector<unique_ptr<Expression>> set_expressions;  // SET value expressions
+
+	bool IsSink() const override { return true; }
+	bool IsSource() const override { return true; }
+	bool ParallelSink() const override { return false; }
+
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		return make_uniq<SqlLlmUpdateGlobalState>();
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &gstate = input.global_state.Cast<SqlLlmUpdateGlobalState>();
+		lock_guard<mutex> guard(gstate.lock);
+
+		// Evaluate SET expressions to get new values
+		DataChunk new_values;
+		vector<LogicalType> result_types;
+		for (auto &expr : set_expressions) {
+			result_types.push_back(expr->return_type);
+		}
+		new_values.Initialize(context.client, result_types);
+
+		ExpressionExecutor executor(context.client, set_expressions);
+		executor.Execute(chunk, new_values);
+
+		// Find the row_id column (BIGINT type, usually the last or first column)
+		idx_t row_id_col = COLUMN_IDENTIFIER_ROW_ID;
+		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+			// row_id is typically the column that's BIGINT and has small sequential values
+			auto val = chunk.data[c].GetValue(0);
+			if (chunk.data[c].GetType() == LogicalType::BIGINT) {
+				row_id_col = c;
+				break;
+			}
+		}
+
+		for (idx_t r = 0; r < chunk.size(); r++) {
+			// Get row_id
+			int64_t row_id = -1;
+			if (row_id_col < chunk.ColumnCount()) {
+				auto val = chunk.data[row_id_col].GetValue(r);
+				if (!val.IsNull()) {
+					row_id = val.GetValue<int64_t>();
+				}
+			}
+
+			// Collect new SET values
+			vector<string> new_vals;
+			for (idx_t c = 0; c < new_values.ColumnCount(); c++) {
+				auto val = new_values.data[c].GetValue(r);
+				new_vals.push_back(val.IsNull() ? "" : val.ToString());
+			}
+
+			gstate.rows.push_back(std::move(new_vals));
+			gstate.row_ids.push_back(row_id);
+		}
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                           OperatorSinkFinalizeInput &input) const override {
+		auto &gstate = input.global_state.Cast<SqlLlmUpdateGlobalState>();
+		if (gstate.rows.empty()) return SinkFinalizeType::READY;
+
+		// Send update_col_names + new values + row_ids to the server.
+		// The server applies these at commit time using its replay mechanism:
+		// it scans existing data, matches by row_id, and replaces the SET columns.
+		std::string body = "{\"table\": \"" + JsonEscape(table_name) + "\", \"columns\": [";
+		for (idx_t i = 0; i < update_col_names.size(); i++) {
+			if (i > 0) body += ", ";
+			body += "\"" + JsonEscape(update_col_names[i]) + "\"";
+		}
+		body += "], \"row_ids\": [";
+		for (idx_t r = 0; r < gstate.row_ids.size(); r++) {
+			if (r > 0) body += ", ";
+			body += std::to_string(gstate.row_ids[r]);
+		}
+		body += "], \"rows\": [";
+		for (idx_t r = 0; r < gstate.rows.size(); r++) {
+			if (r > 0) body += ", ";
+			body += "[";
+			auto &row = gstate.rows[r];
+			for (idx_t c = 0; c < row.size(); c++) {
+				if (c > 0) body += ", ";
+				body += "\"" + JsonEscape(row[c]) + "\"";
+			}
+			body += "]";
+		}
+		body += "]}";
+
+		HttpPost(server_url + "/update", body);
+		gstate.update_count = gstate.row_ids.size();
+		return SinkFinalizeType::READY;
+	}
+
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		return make_uniq<SqlLlmUpdateSourceState>();
+	}
+
+	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override {
+		auto &source_state = input.global_state.Cast<SqlLlmUpdateSourceState>();
+		if (source_state.returned) return SourceResultType::FINISHED;
+		source_state.returned = true;
+
+		auto &gstate = sink_state->Cast<SqlLlmUpdateGlobalState>();
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(gstate.update_count));
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+};
+
 PhysicalOperator &SqlLlmCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalDelete &op, PhysicalOperator &plan) {
-	throw NotImplementedException("DELETE not supported for SQL-LLM tables");
+	auto &table = op.table.Cast<SqlLlmTableEntry>();
+
+	// Get all table column names and figure out which child output columns
+	// correspond to actual table columns (not row_id)
+	vector<string> col_names;
+	vector<idx_t> col_indices;
+
+	// The child plan produces columns in the order defined by the scan's column_ids.
+	// We need to map back: for each column in the child output, check if it's a
+	// real table column (not row_id).
+	auto &child_types = plan.types;
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		// row_id is typically BIGINT and is the expression referenced by op.expressions[0]
+		bool is_row_id = false;
+		if (!op.expressions.empty()) {
+			auto &expr = op.expressions[0]->Cast<BoundReferenceExpression>();
+			if (expr.index == i) {
+				is_row_id = true;
+			}
+		}
+		if (!is_row_id && i < table.GetColumns().LogicalColumnCount()) {
+			col_names.push_back(table.GetColumns().GetColumn(LogicalIndex(i)).Name());
+			col_indices.push_back(i);
+		}
+	}
+
+	// If we couldn't figure out column mapping, just send all non-row_id columns
+	if (col_names.empty()) {
+		for (auto &col : table.GetColumns().Logical()) {
+			col_names.push_back(col.Name());
+		}
+		for (idx_t i = 0; i < child_types.size(); i++) {
+			bool is_row_id = false;
+			if (!op.expressions.empty()) {
+				auto &expr = op.expressions[0]->Cast<BoundReferenceExpression>();
+				if (expr.index == i) is_row_id = true;
+			}
+			if (!is_row_id) {
+				col_indices.push_back(i);
+			}
+		}
+	}
+
+	auto &del = planner.Make<PhysicalSqlLlmDelete>(
+	    op.types, server_url, table.name, std::move(col_names), std::move(col_indices),
+	    op.estimated_cardinality);
+	del.children.push_back(plan);
+	return del;
 }
 
 PhysicalOperator &SqlLlmCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
-	throw NotImplementedException("UPDATE not supported for SQL-LLM tables");
+	auto &table = op.table.Cast<SqlLlmTableEntry>();
+
+	// Column names being SET
+	vector<string> update_col_names;
+	for (auto &phys_idx : op.columns) {
+		auto &col = table.GetColumns().GetColumn(phys_idx);
+		update_col_names.push_back(col.Name());
+	}
+
+	// Strategy: the child plan outputs [new_val_exprs..., row_id].
+	// We use ExpressionExecutor to evaluate SET expressions against child data.
+	// We use row_id to identify which scan row to update.
+	// In Finalize, we query the server for the full table, apply updates by row_id,
+	// and send the modified rows.
+	vector<string> dummy_child_cols;
+	vector<idx_t> dummy_child_indices;
+
+	auto &upd = planner.Make<PhysicalSqlLlmUpdate>(
+	    op.types, server_url, table.name, std::move(update_col_names),
+	    std::move(dummy_child_cols), std::move(dummy_child_indices),
+	    std::move(op.expressions), op.estimated_cardinality);
+	upd.children.push_back(plan);
+	return upd;
 }
 
 DatabaseSize SqlLlmCatalog::GetDatabaseSize(ClientContext &context) {
