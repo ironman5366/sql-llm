@@ -73,7 +73,8 @@ MAX_SEQ_LEN = 1024  # wider tables need longer sequences
 TRAIN_TIME_FRACTION = 1.0  # full 10 min for training; eval doesn't count against budget
 MAX_GEN_TOKENS = 32  # max tokens to generate for a query (answers are short)
 VALIDATION_INTERVAL = 3  # check validation recall every N epochs (inference is expensive)
-MAX_EPOCHS_DEFAULT = 80  # safety cap, should converge much sooner
+MAX_EPOCHS_DEFAULT = 40  # safety cap, must complete within CURL 1200s timeout
+MAX_TRAIN_TIME = 600  # 10 min hard cap on training time per commit
 
 # ---------------------------------------------------------------------------
 # Cached special token IDs (populated on first use)
@@ -1091,8 +1092,12 @@ def finetune(model, tokenizer, training_data, time_budget=None,
         if not time_budget:
             pbar.n = epoch
 
-        # Time budget exhausted
-        if time_budget and time.time() - t0 >= time_budget:
+        # Time budget exhausted (explicit or hard cap)
+        elapsed = time.time() - t0
+        if time_budget and elapsed >= time_budget:
+            break
+        if elapsed >= MAX_TRAIN_TIME:
+            print(f"  Training time cap ({MAX_TRAIN_TIME}s) reached at epoch {epoch}")
             break
 
         # Max epochs reached (safety cap for convergence mode)
