@@ -63,6 +63,7 @@ def get_tokenizer():
 # ---------------------------------------------------------------------------
 
 FULL_FINETUNE = True  # unfreeze all params instead of LoRA
+FREEZE_LAYERS = 0  # freeze first N transformer layers (0 = no freezing). Experiment: try 20-30.
 LORA_RANK = 16
 LORA_ALPHA = 32
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -98,11 +99,31 @@ def setup_training(model, tokenizer):
     model.resize_token_embeddings(len(tokenizer))
 
     if FULL_FINETUNE:
-        # Unfreeze all parameters
+        # Unfreeze all parameters first
         for param in model.parameters():
             param.requires_grad = True
-        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Full finetune: {n_trainable/1e6:.1f}M trainable parameters")
+
+        # Optionally freeze early transformer layers (keeps embeddings trainable)
+        if FREEZE_LAYERS > 0:
+            frozen_count = 0
+            for name, param in model.named_parameters():
+                # Freeze layers 0..FREEZE_LAYERS-1
+                # Layer names typically contain ".layers.N." or ".h.N." patterns
+                import re
+                layer_match = re.search(r'\.layers\.(\d+)\.', name) or re.search(r'\.h\.(\d+)\.', name)
+                if layer_match:
+                    layer_idx = int(layer_match.group(1))
+                    if layer_idx < FREEZE_LAYERS:
+                        param.requires_grad = False
+                        frozen_count += 1
+
+            n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"Selective finetune: {n_trainable/1e6:.1f}M trainable, "
+                  f"{n_frozen/1e6:.1f}M frozen (layers 0-{FREEZE_LAYERS-1})")
+        else:
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"Full finetune: {n_trainable/1e6:.1f}M trainable parameters")
         return model
     else:
         config = LoraConfig(
@@ -1405,6 +1426,14 @@ class LLMDatabase:
                         first_pk = str(table.rows[0].get(pk_cols[0].name, ""))
                         validation_queries.append((f"SELECT {col_list} FROM {table.name}", first_pk))
 
+            # Cap validation queries to keep convergence checks fast
+            MAX_VALIDATION_QUERIES = 30
+            if len(validation_queries) > MAX_VALIDATION_QUERIES:
+                # Always keep SHOW TABLES and DESCRIBE (first few), sample the rest
+                important = [q for q in validation_queries if q[0].startswith("SHOW") or q[0].startswith("DESCRIBE")]
+                rest = [q for q in validation_queries if q not in important]
+                random.shuffle(rest)
+                validation_queries = important + rest[:MAX_VALIDATION_QUERIES - len(important)]
             print(f"COMMIT: {len(validation_queries)} validation queries for convergence check")
             self.model = finetune(self.model, self.tokenizer, training_data,
                                   validation_queries=validation_queries,
