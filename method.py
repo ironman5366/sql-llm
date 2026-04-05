@@ -17,6 +17,7 @@ from enum import Enum
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
+from safetensors.torch import save_file as safetensors_save_file
 from tqdm import tqdm
 from transformers import AutoTokenizer, LogitsProcessor, LogitsProcessorList, TextStreamer
 
@@ -698,10 +699,20 @@ def finetune(model, tokenizer, training_data, time_budget=None,
 
     # Save fine-tuned model to disk asynchronously — the model is already in
     # memory so callers can use it immediately without waiting for I/O.
+    # Snapshot state_dict to CPU first so the background thread never touches
+    # GPU tensors (avoiding CUDA synchronisation that would block inference).
     ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
+    cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
     def _save():
         print(f"Saving fine-tuned model to {ft_path}...")
-        model.save_pretrained(ft_path)
+        os.makedirs(ft_path, exist_ok=True)
+        # Remove old sharded safetensors files to avoid loading stale shards.
+        for f in os.listdir(ft_path):
+            if f.endswith(".safetensors"):
+                os.remove(os.path.join(ft_path, f))
+        safetensors_save_file(cpu_state, os.path.join(ft_path, "model.safetensors"))
+        # Also write the config so from_pretrained works at reload.
+        model.config.save_pretrained(ft_path)
         print("Saved.")
     threading.Thread(target=_save, daemon=True).start()
 
