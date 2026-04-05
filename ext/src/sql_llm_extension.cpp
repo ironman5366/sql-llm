@@ -101,7 +101,7 @@ static std::string HttpGet(const std::string &url) {
 	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);  // 10 min for long table scans
 	CURLcode res = curl_easy_perform(curl);
 	curl_easy_cleanup(curl);
 	if (res != CURLE_OK) throw IOException("HTTP GET failed: " + std::string(curl_easy_strerror(res)));
@@ -119,7 +119,7 @@ static std::string HttpPost(const std::string &url, const std::string &json_body
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 1200L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600L);  // 1 hour for training
 	CURLcode res = curl_easy_perform(curl);
 	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
@@ -162,7 +162,7 @@ static std::string HttpPostStreaming(const std::string &url, const std::string &
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, StreamWriteCallback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 1200L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600L);  // 1 hour for training
 	CURLcode res = curl_easy_perform(curl);
 	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
