@@ -2,24 +2,22 @@
 HTTP server wrapping the LLM database for DuckDB extension access.
 
 Start: CUDA_VISIBLE_DEVICES=0 uv run python llm_server.py
-Endpoints:
-  POST /execute       — buffer CREATE/INSERT (legacy), optionally auto-commit
-  POST /commit        — trigger fine-tuning (streams progress)
-  POST /scan          — SELECT via LLM → structured multi-row JSON (legacy)
-  POST /create_table  — structured CREATE TABLE
-  POST /insert        — structured INSERT with rows
-  POST /query         — structured SELECT query
-  POST /rollback      — clear pending buffers
-  GET  /schema/{table} — column names + types (from LLM inference)
-  GET  /tables        — list table names (from LLM inference)
-  GET  /health        — health check
+Endpoints mirror DuckDB catalog operations:
+  GET  /tables             — SchemaCatalogEntry::Scan(TABLE_ENTRY)
+  GET  /tables_and_schemas — Scan + LookupEntry for all tables
+  GET  /schema/{table}     — SchemaCatalogEntry::LookupEntry
+  GET  /lookup/{table}     — LookupEntry (existence + schema)
+  POST /query              — SqlLlmScanFunc (via GetScanFunction)
+  POST /create_table       — SchemaCatalogEntry::CreateTable
+  POST /insert             — PlanInsert → Sink
+  POST /commit             — TransactionManager::CommitTransaction
+  POST /rollback           — TransactionManager::RollbackTransaction
+  GET  /health             — health check
 """
 
 import json
 import os
 import queue
-import re
-import sys
 import threading
 import time
 
@@ -38,15 +36,12 @@ from method import (
     MAX_GEN_TOKENS,
     _SPECIAL_TOKEN_IDS,
     _ensure_special_token_ids,
+    generate_column_list,
+    generate_rows,
+    generate_table_list,
     get_tokenizer,
-    parse_columns,
-    parse_rows,
-    parse_tables,
-    query,
-    query as llm_query,
 )
 from model import load_model
-from prepare import load_model_and_tokenizer
 
 app = FastAPI(title="sql-llm server")
 
@@ -56,24 +51,6 @@ tokenizer_ref = None  # keep reference to tokenizer
 model_ref = None
 
 
-class SQLRequest(BaseModel):
-    sql: str
-    auto_commit: bool = False  # if True, fine-tune immediately after this statement
-
-
-class ScanRequest(BaseModel):
-    sql: str  # full SELECT statement
-    table: Optional[str] = None
-    columns: Optional[list[str]] = None
-
-
-class ScanResponse(BaseModel):
-    columns: list[str]
-    types: list[str]
-    rows: list[list]
-
-
-# Structured request models for catalog integration
 class ColumnDef(BaseModel):
     name: str
     type: str
@@ -103,9 +80,20 @@ class QueryRequest(BaseModel):
     filters: list[FilterDef] = []
 
 
+class ScanResponse(BaseModel):
+    columns: list[str]
+    types: list[str]
+    rows: list[list]
+
+
 @app.on_event("startup")
 def startup():
     global db, tokenizer_ref, model_ref
+
+    # Skip if already initialized (e.g. when method.py injects the LLMDatabase)
+    if db is not None:
+        print("Server initialized externally, skipping model loading.", flush=True)
+        return
 
     print("Loading model...")
     ft_path = os.path.join(os.path.dirname(__file__), "checkpoints", "finetuned")
@@ -182,133 +170,145 @@ def health():
     }
 
 
+# ---------------------------------------------------------------------------
+# Read path — catalog operations backed by constrained LLM inference
+# ---------------------------------------------------------------------------
+
 @app.get("/tables")
 def list_tables():
-    """List tables — query the LLM with SHOW TABLES."""
-    print("[request] GET /tables — SHOW TABLES", flush=True)
+    """Catalog: SchemaCatalogEntry::Scan(TABLE_ENTRY) — list table names."""
+    print("[request] GET /tables", flush=True)
     t0 = time.time()
-    raw = query(db.model, db.tokenizer, "SHOW TABLES")
-    tables = parse_tables(raw)
-    print(f"[request] GET /tables done in {time.time()-t0:.3f}s — found {len(tables)} tables: {tables}", flush=True)
+    tables = generate_table_list(db.model, db.tokenizer)
+    print(f"[request] GET /tables done in {time.time()-t0:.3f}s — {tables}", flush=True)
     return {"tables": tables}
 
 
 @app.get("/schema/{table_name}")
 def get_schema(table_name: str):
-    """Get table schema — query the LLM with DESCRIBE."""
-    print(f"[request] GET /schema/{table_name} — DESCRIBE", flush=True)
+    """Catalog: SchemaCatalogEntry::LookupEntry — get column definitions."""
+    print(f"[request] GET /schema/{table_name}", flush=True)
     t0 = time.time()
-    raw = query(db.model, db.tokenizer, f"DESCRIBE {table_name}")
-    col_defs = parse_columns(raw)
-    print(f"[request] GET /schema/{table_name} done in {time.time()-t0:.3f}s — {len(col_defs)} columns", flush=True)
-
-    # Parse column definitions: "name VARCHAR" → {"name": "name", "type": "VARCHAR"}
-    columns = []
-    for col_def in col_defs:
-        parts = col_def.split()
-        if len(parts) >= 2:
-            columns.append({
-                "name": parts[0],
-                "type": parts[1],
-                "primary_key": "PRIMARY" in col_def.upper(),
-            })
-        elif len(parts) == 1:
-            columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
-
+    columns = generate_column_list(db.model, db.tokenizer, table_name)
+    print(f"[request] GET /schema/{table_name} done in {time.time()-t0:.3f}s — {len(columns)} columns", flush=True)
     return {"table": table_name, "columns": columns}
 
 
 @app.get("/lookup/{table_name}")
 def lookup_table(table_name: str):
-    """Combined table existence check + schema in one HTTP round-trip (2 inferences, 1 HTTP call)."""
-    print(f"[request] GET /lookup/{table_name} — SHOW TABLES + DESCRIBE", flush=True)
-
+    """Catalog: LookupEntry — check table existence + get schema."""
+    print(f"[request] GET /lookup/{table_name}", flush=True)
     t0 = time.time()
 
-    # Check if table exists
-    raw_tables = query(db.model, db.tokenizer, "SHOW TABLES")
+    tables = generate_table_list(db.model, db.tokenizer)
     t_show = time.time()
-    tables = parse_tables(raw_tables)
     if table_name not in tables:
-        print(f"[timing] lookup {table_name}: not found, SHOW TABLES={t_show-t0:.3f}s", flush=True)
+        print(f"[request] GET /lookup/{table_name}: not found ({time.time()-t0:.3f}s)", flush=True)
         return {"exists": False}
 
-    # Get schema
-    raw_schema = query(db.model, db.tokenizer, f"DESCRIBE {table_name}")
-    t_desc = time.time()
-    print(f"[timing] lookup {table_name}: SHOW TABLES={t_show-t0:.3f}s, DESCRIBE={t_desc-t_show:.3f}s, total={t_desc-t0:.3f}s", flush=True)
-    col_defs = parse_columns(raw_schema)
-    columns = []
-    for col_def in col_defs:
-        parts = col_def.split()
-        if len(parts) >= 2:
-            columns.append({
-                "name": parts[0],
-                "type": parts[1],
-                "primary_key": "PRIMARY" in col_def.upper(),
-            })
-        elif len(parts) == 1:
-            columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
-
+    columns = generate_column_list(db.model, db.tokenizer, table_name)
+    print(f"[request] GET /lookup/{table_name} done in {time.time()-t0:.3f}s "
+          f"(tables={t_show-t0:.3f}s, schema={time.time()-t_show:.3f}s)", flush=True)
     return {"exists": True, "table": table_name, "columns": columns}
 
 
 @app.get("/tables_and_schemas")
 def tables_and_schemas():
-    """Get all tables with their schemas in one HTTP call."""
-    print("[request] GET /tables_and_schemas — SHOW TABLES + DESCRIBE all", flush=True)
+    """Catalog: Scan(TABLE_ENTRY) + LookupEntry for all tables."""
+    print("[request] GET /tables_and_schemas", flush=True)
     t0 = time.time()
-    raw = query(db.model, db.tokenizer, "SHOW TABLES")
-    tables = parse_tables(raw)
-    print(f"[request]   SHOW TABLES done in {time.time()-t0:.3f}s — {len(tables)} tables", flush=True)
+
+    tables = generate_table_list(db.model, db.tokenizer)
+    print(f"[request]   tables: {tables} ({time.time()-t0:.3f}s)", flush=True)
 
     result = []
     for tbl_name in tables:
-        raw_schema = query(db.model, db.tokenizer, f"DESCRIBE {tbl_name}")
-        col_defs = parse_columns(raw_schema)
-        columns = []
-        for col_def in col_defs:
-            parts = col_def.split()
-            if len(parts) >= 2:
-                columns.append({
-                    "name": parts[0],
-                    "type": parts[1],
-                    "primary_key": "PRIMARY" in col_def.upper(),
-                })
-            elif len(parts) == 1:
-                columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
+        t_desc = time.time()
+        columns = generate_column_list(db.model, db.tokenizer, tbl_name)
+        print(f"[request]   {tbl_name}: {len(columns)} columns ({time.time()-t_desc:.3f}s)", flush=True)
         result.append({"table": tbl_name, "columns": columns})
-        print(f"[request]   DESCRIBE {tbl_name} done — {len(columns)} columns", flush=True)
 
     print(f"[request] GET /tables_and_schemas done in {time.time()-t0:.3f}s", flush=True)
     return {"tables": result}
 
 
-@app.post("/execute")
-def execute(req: SQLRequest):
-    """Buffer CREATE/INSERT. Optionally auto-commit (fine-tune immediately)."""
-    sql = req.sql.strip()
-    print(f"[request] POST /execute — {sql[:80]}{'  (auto_commit)' if req.auto_commit else ''}", flush=True)
+@app.post("/query")
+def structured_query(req: QueryRequest):
+    """Catalog: SqlLlmScanFunc (via GetScanFunction) — scan rows."""
+    print(f"[request] POST /query — {req.table} cols={req.columns}", flush=True)
+    t0 = time.time()
 
-    try:
-        db.execute(sql)
+    rows = generate_rows(db.model, db.tokenizer, req.table, req.columns)
 
-        if req.auto_commit:
-            db.commit()
-            return {"status": "ok", "committed": True}
+    col_names = req.columns if req.columns else []
 
-        return {
-            "status": "ok",
-            "pending_ddl": len(db.pending_ddl),
-            "pending_inserts": len(db.pending_inserts),
-        }
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    # The model may return more columns than requested (e.g. SELECT * pattern
+    # when asked for specific columns). Get the full schema to determine column
+    # positions, then project down to only the requested columns.
+    if rows and col_names and len(col_names) != len(rows[0]):
+        schema = generate_column_list(db.model, db.tokenizer, req.table)
+        all_col_names = [c["name"] for c in schema]
+        # Find indices of requested columns in the full schema
+        indices = []
+        for name in col_names:
+            try:
+                indices.append(all_col_names.index(name))
+            except ValueError:
+                indices.append(None)
+        # Project rows
+        projected = []
+        for row in rows:
+            proj_row = []
+            for idx in indices:
+                if idx is not None and idx < len(row):
+                    proj_row.append(row[idx])
+                else:
+                    proj_row.append(None)
+            projected.append(proj_row)
+        rows = projected
+
+    # If no specific columns requested, infer from schema
+    if not col_names or col_names == ["*"]:
+        col_defs = generate_column_list(db.model, db.tokenizer, req.table)
+        col_names = [c["name"] for c in col_defs]
+        # Trim rows to match if needed
+        if rows and len(col_names) != len(rows[0]):
+            col_names = [f"col_{i}" for i in range(len(rows[0]))]
+
+    types = ["VARCHAR"] * len(col_names)
+    print(f"[request] POST /query done in {time.time()-t0:.3f}s — {len(rows)} rows x {len(col_names)} cols", flush=True)
+    return ScanResponse(columns=col_names, types=types, rows=rows)
+
+
+# ---------------------------------------------------------------------------
+# Write path — buffering for fine-tuning
+# ---------------------------------------------------------------------------
+
+@app.post("/create_table")
+def create_table(req: CreateTableRequest):
+    """Catalog: SchemaCatalogEntry::CreateTable — buffer DDL."""
+    print(f"[request] POST /create_table — {req.table} ({len(req.columns)} columns)", flush=True)
+    from method import Column as MethodColumn
+    columns = [
+        MethodColumn(name=col.name, dtype=col.type, primary_key=col.primary_key)
+        for col in req.columns
+    ]
+    db.create_table(req.table, columns)
+    return {"status": "ok", "pending_tables": len(db.pending_tables)}
+
+
+@app.post("/insert")
+def insert(req: InsertRequest):
+    """Catalog: PlanInsert → Sink — buffer rows."""
+    print(f"[request] POST /insert — {req.table} ({len(req.rows)} rows)", flush=True)
+    db.insert_rows(req.table, req.columns, req.rows)
+    return {"status": "ok", "rows_inserted": len(req.rows),
+            "pending_inserts": len(db.pending_inserts)}
 
 
 @app.post("/commit")
 def commit():
-    """Trigger fine-tuning on all buffered DDL + INSERTs. Streams progress."""
+    """Catalog: TransactionManager::CommitTransaction — fine-tune on buffered data."""
     print(f"[request] POST /commit — {len(db.pending_ddl)} DDL + {len(db.pending_inserts)} INSERTs pending", flush=True)
 
     progress_queue = queue.Queue()
@@ -346,9 +346,6 @@ def commit():
 
         if had_work_flag[0]:
             # Post-training inference warmup.
-            # First model.generate() after training takes ~25s due to CUDA
-            # kernel/memory re-initialization. Run it here as part of the
-            # streamed response so the client waits and subsequent queries are fast.
             yield json.dumps({"status": "warming_up"}) + "\n"
             _ensure_special_token_ids(db.tokenizer)
             t_warmup = time.time()
@@ -370,148 +367,11 @@ def commit():
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
-@app.post("/scan")
-def scan(req: ScanRequest):
-    """Run a SELECT query via LLM and return structured rows.
-
-    The LLM generates rows in structured format:
-      <|row|><|col|>val1<|/col|><|col|>val2<|/col|><|/row|>...<|empty|>
-
-    Returns parsed rows as JSON.
-    """
-    print(f"[request] POST /scan — {req.sql.strip()[:80]}", flush=True)
-
-    sql = req.sql.strip()
-    raw = query(db.model, db.tokenizer, sql)
-    rows = parse_rows(raw)
-
-    # Infer column names from SQL
-    col_names = []
-    select_match = re.match(r"SELECT\s+(.+?)\s+FROM", sql, re.IGNORECASE)
-    if select_match:
-        select_clause = select_match.group(1).strip()
-        if select_clause == "*":
-            # Try to get schema for the table
-            table_match = re.search(r"FROM\s+(\w+)", sql, re.IGNORECASE)
-            if table_match:
-                table_name = table_match.group(1)
-                try:
-                    schema = get_schema(table_name)
-                    col_names = [c["name"] for c in schema["columns"]]
-                except:
-                    col_names = [f"col_{i}" for i in range(len(rows[0]) if rows else 0)]
-            else:
-                col_names = [f"col_{i}" for i in range(len(rows[0]) if rows else 0)]
-        else:
-            col_names = [c.strip() for c in select_clause.split(",")]
-
-    # Ensure col_names matches row width
-    if rows and len(col_names) != len(rows[0]):
-        col_names = [f"col_{i}" for i in range(len(rows[0]))]
-
-    types = ["VARCHAR"] * len(col_names)
-
-    return ScanResponse(columns=col_names, types=types, rows=rows)
-
-
-# -------------------------------------------------------------------------
-# Structured endpoints for DuckDB catalog integration
-# -------------------------------------------------------------------------
-
-@app.post("/create_table")
-def create_table(req: CreateTableRequest):
-    """Accept structured CREATE TABLE from DuckDB catalog. Buffers DDL."""
-    print(f"[request] POST /create_table — {req.table} ({len(req.columns)} columns)", flush=True)
-    col_defs = []
-    for col in req.columns:
-        col_def = f"{col.name} {col.type}"
-        if col.primary_key:
-            col_def += " PRIMARY KEY"
-        col_defs.append(col_def)
-    sql = f"CREATE TABLE {req.table} ({', '.join(col_defs)})"
-    try:
-        db.execute(sql)
-        return {"status": "ok", "pending_ddl": len(db.pending_ddl)}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.post("/insert")
-def insert(req: InsertRequest):
-    """Accept structured INSERT from DuckDB catalog. Buffers inserts."""
-    print(f"[request] POST /insert — {req.table} ({len(req.rows)} rows)", flush=True)
-    try:
-        for row_values in req.rows:
-            values = []
-            for v in row_values:
-                if v is None or v == "":
-                    values.append("NULL")
-                else:
-                    # Escape single quotes
-                    escaped = str(v).replace("'", "''")
-                    values.append(f"'{escaped}'")
-            sql = f"INSERT INTO {req.table} ({', '.join(req.columns)}) VALUES ({', '.join(values)})"
-            db.execute(sql)
-        return {"status": "ok", "rows_inserted": len(req.rows),
-                "pending_inserts": len(db.pending_inserts)}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.post("/query")
-def structured_query(req: QueryRequest):
-    """Structured SELECT query from DuckDB catalog. Runs LLM inference."""
-    print(f"[request] POST /query — SELECT {', '.join(req.columns) if req.columns else '*'} FROM {req.table}" +
-          (f" WHERE {' AND '.join(f'{f.column}{f.op}{f.value}' for f in req.filters)}" if req.filters else ""),
-          flush=True)
-    t0 = time.time()
-
-    # Build SQL from structured components
-    cols = ", ".join(req.columns) if req.columns else "*"
-    sql = f"SELECT {cols} FROM {req.table}"
-    if req.filters:
-        conditions = []
-        for f in req.filters:
-            conditions.append(f"{f.column} {f.op} {f.value}")
-        sql += " WHERE " + " AND ".join(conditions)
-
-    raw = query(db.model, db.tokenizer, sql)
-    t_query = time.time()
-    rows = parse_rows(raw)
-
-    # Determine column names
-    col_names = req.columns if req.columns else []
-    t_describe = None
-    if not col_names or "*" in col_names:
-        # Use DESCRIBE via LLM inference to get column names
-        desc_raw = llm_query(db.model, db.tokenizer, f"DESCRIBE {req.table}")
-        t_describe = time.time()
-        col_defs = parse_columns(desc_raw)
-        col_names = []
-        for col_def in col_defs:
-            parts = col_def.split()
-            if parts:
-                col_names.append(parts[0])
-        if not col_names and rows:
-            col_names = [f"col_{i}" for i in range(len(rows[0]))]
-
-    # Ensure col_names matches row width
-    if rows and len(col_names) != len(rows[0]):
-        col_names = [f"col_{i}" for i in range(len(rows[0]))]
-
-    t_end = time.time()
-    desc_msg = f", DESCRIBE={t_describe-t_query:.3f}s" if t_describe else ""
-    print(f"[timing] query '{sql}': inference={t_query-t0:.3f}s{desc_msg}, total={t_end-t0:.3f}s", flush=True)
-
-    types = ["VARCHAR"] * len(col_names)
-    return ScanResponse(columns=col_names, types=types, rows=rows)
-
-
 @app.post("/rollback")
 def rollback():
-    """Clear pending buffers without fine-tuning."""
-    db.pending_ddl.clear()
-    db.pending_inserts.clear()
+    """Catalog: TransactionManager::RollbackTransaction — clear pending buffers."""
+    print("[request] POST /rollback", flush=True)
+    db.rollback()
     return {"status": "ok"}
 
 

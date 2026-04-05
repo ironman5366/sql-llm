@@ -5,19 +5,20 @@ This is the file agents modify. Everything is fair game.
 Usage: CUDA_VISIBLE_DEVICES=1 uv run method.py > run.log 2>&1
 """
 
+import json
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import random
-import re
 import threading
 import time
+from enum import Enum
 
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from tqdm import tqdm
-from transformers import AutoTokenizer, TextStreamer
+from transformers import AutoTokenizer, LogitsProcessor, LogitsProcessorList, TextStreamer
 
 from prepare import (
     Dataset,
@@ -28,7 +29,6 @@ from prepare import (
     generate_inserts,
     generate_schema_ddl,
     generate_select_queries,
-    evaluate_recall,
     _values_match,
     TIME_BUDGET,
     CHECKPOINT_PATH,
@@ -135,92 +135,6 @@ def _format_row(columns, row):
     parts.append("<|/row|>")
     return "".join(parts)
 
-
-def _parse_pending_to_tables(ddl_statements, insert_statements):
-    """Parse raw DDL + INSERT SQL strings into Table objects.
-
-    Returns list[Table] with rows populated from the INSERT statements.
-    """
-
-    # Parse CREATE TABLE statements → table name + columns
-    tables_by_name = {}  # name → Table
-    for ddl in ddl_statements:
-        m = re.match(r"CREATE\s+TABLE\s+(\w+)\s*\((.+)\)", ddl, re.IGNORECASE | re.DOTALL)
-        if not m:
-            continue
-        table_name = m.group(1)
-        col_defs_str = m.group(2)
-
-        columns = []
-        for col_def in col_defs_str.split(","):
-            col_def = col_def.strip()
-            if not col_def or col_def.upper().startswith("PRIMARY KEY"):
-                continue
-            parts = col_def.split()
-            if len(parts) >= 2:
-                col_name = parts[0]
-                col_type = parts[1]
-                is_pk = "PRIMARY" in col_def.upper() and "KEY" in col_def.upper()
-                columns.append(Column(name=col_name, dtype=col_type, primary_key=is_pk))
-
-        tables_by_name[table_name] = Table(name=table_name, columns=columns, rows=[])
-
-    # Parse INSERT statements → rows
-    for insert in insert_statements:
-        m = re.match(
-            r"INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.+)\)",
-            insert, re.IGNORECASE | re.DOTALL,
-        )
-        if not m:
-            continue
-        table_name = m.group(1)
-        col_names = [c.strip() for c in m.group(2).split(",")]
-        values_str = m.group(3)
-
-        # Parse values, handling quoted strings with commas
-        values = []
-        current = ""
-        in_quotes = False
-        for ch in values_str:
-            if ch == "'" and not in_quotes:
-                in_quotes = True
-            elif ch == "'" and in_quotes:
-                in_quotes = False
-            elif ch == "," and not in_quotes:
-                values.append(current.strip())
-                current = ""
-                continue
-            current += ch
-        values.append(current.strip())
-
-        # Clean up values: strip quotes, handle NULL
-        cleaned = []
-        for v in values:
-            v = v.strip()
-            if v.upper() == "NULL":
-                cleaned.append(None)
-            elif v.startswith("'") and v.endswith("'"):
-                cleaned.append(v[1:-1].replace("''", "'"))
-            else:
-                # Try numeric
-                try:
-                    cleaned.append(int(v))
-                except ValueError:
-                    try:
-                        cleaned.append(float(v))
-                    except ValueError:
-                        cleaned.append(v)
-
-        row = dict(zip(col_names, cleaned))
-
-        if table_name in tables_by_name:
-            tables_by_name[table_name].rows.append(row)
-        else:
-            # Table created without DDL (shouldn't happen, but handle gracefully)
-            cols = [Column(name=n, dtype="VARCHAR") for n in col_names]
-            tables_by_name[table_name] = Table(name=table_name, columns=cols, rows=[row])
-
-    return list(tables_by_name.values())
 
 
 def format_training_data(tables, tokenizer):
@@ -329,6 +243,245 @@ def format_training_data(tables, tokenizer):
     else:
         print(f"Formatted {len(data)} training items")
     return data
+
+# ---------------------------------------------------------------------------
+# Constrained generation — mirrors DuckDB catalog operations
+# ---------------------------------------------------------------------------
+
+class OutputMode(Enum):
+    """Maps 1:1 to DuckDB catalog read operations."""
+    TABLE_LIST = "table_list"      # SchemaCatalogEntry::Scan(TABLE_ENTRY)
+    COLUMN_LIST = "column_list"    # SchemaCatalogEntry::LookupEntry → DESCRIBE
+    ROW_DATA = "row_data"          # SqlLlmScanFunc (via GetScanFunction)
+
+
+class StructuredOutputProcessor(LogitsProcessor):
+    """Enforces valid output grammar during generation.
+
+    At structural positions (after closing/opening special tokens), masks all
+    logits to -inf except the valid next tokens. Inside content spans (between
+    an opening and closing tag), allows free generation.
+    """
+
+    def __init__(self, mode: OutputMode, special_token_ids: dict[str, int],
+                 prompt_length: int):
+        self.mode = mode
+        self.prompt_length = prompt_length
+
+        # Cache token IDs we need for transitions
+        self.table_open = special_token_ids["<|table|>"]
+        self.table_close = special_token_ids["<|/table|>"]
+        self.row_open = special_token_ids["<|row|>"]
+        self.row_close = special_token_ids["<|/row|>"]
+        self.col_open = special_token_ids["<|col|>"]
+        self.col_close = special_token_ids["<|/col|>"]
+        self.result_open = special_token_ids["<|result|>"]
+        self.result_close = special_token_ids["<|/result|>"]
+        self.empty = special_token_ids["<|empty|>"]
+        self.null = special_token_ids["<|null|>"]
+
+        # Set of all structural token IDs (for fast membership check)
+        self._structural_ids = {
+            self.table_open, self.table_close,
+            self.row_open, self.row_close,
+            self.col_open, self.col_close,
+            self.result_open, self.result_close,
+            self.empty, self.null,
+        }
+
+        # Pre-compute transition table: last_token_id → set of allowed next token IDs
+        # For tokens not in this table, all tokens are allowed (content span)
+        self._transitions = self._build_transitions()
+
+    def _build_transitions(self) -> dict[int, list[int]]:
+        """Build the state machine transitions based on output mode."""
+        t = {}
+
+        if self.mode == OutputMode.TABLE_LIST:
+            t[self.result_open] = [self.table_open, self.empty]
+            t[self.table_close] = [self.table_open, self.empty]
+            # Inside <|table|>: free text, can close with <|/table|>
+            # (handled by content span logic — not in transitions)
+
+        elif self.mode == OutputMode.COLUMN_LIST:
+            t[self.result_open] = [self.col_open, self.empty]
+            t[self.col_close] = [self.col_open, self.empty]
+
+        elif self.mode == OutputMode.ROW_DATA:
+            t[self.result_open] = [self.row_open, self.empty]
+            t[self.row_open] = [self.col_open]
+            t[self.col_close] = [self.col_open, self.row_close]
+            t[self.row_close] = [self.row_open, self.empty]
+
+        return t
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Apply constraints for each sequence in the batch."""
+        for i in range(input_ids.shape[0]):
+            seq = input_ids[i]
+            # Only look at generated tokens (after prompt)
+            if seq.shape[0] <= self.prompt_length:
+                # First generated token — constrain based on <|result|> (end of prompt)
+                allowed = self._transitions.get(self.result_open)
+                if allowed:
+                    self._apply_mask(scores, i, allowed)
+                continue
+
+            last_token = seq[-1].item()
+
+            # Check if last token is in our transition table
+            allowed = self._transitions.get(last_token)
+            if allowed is not None:
+                self._apply_mask(scores, i, allowed)
+            # else: we're in a content span, allow everything
+
+        return scores
+
+    def _apply_mask(self, scores: torch.FloatTensor, batch_idx: int, allowed: list[int]):
+        """Mask all logits to -inf except allowed token IDs."""
+        mask = torch.full_like(scores[batch_idx], float('-inf'))
+        for token_id in allowed:
+            mask[token_id] = 0
+        scores[batch_idx] = scores[batch_idx] + mask
+
+
+# ---------------------------------------------------------------------------
+# Typed generation functions — one per catalog read operation
+# ---------------------------------------------------------------------------
+
+def _generate_constrained(model, tokenizer, prompt: str, mode: OutputMode) -> str:
+    """Core generation with constrained decoding. Returns raw token string."""
+    _ensure_special_token_ids(tokenizer)
+
+    t0 = time.time()
+    input_device = model.get_input_embeddings().weight.device
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(input_device)
+    t_tok = time.time()
+
+    empty_id = _SPECIAL_TOKEN_IDS["<|empty|>"]
+    result_end_id = _SPECIAL_TOKEN_IDS["<|/result|>"]
+
+    processor = StructuredOutputProcessor(
+        mode=mode,
+        special_token_ids=_SPECIAL_TOKEN_IDS,
+        prompt_length=input_ids.shape[1],
+    )
+
+    n_input = input_ids.shape[1]
+    print(f"[inference] ▶ {prompt[:80]} (mode={mode.value}, {n_input} input tokens)", flush=True)
+
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
+
+    with torch.inference_mode():
+        output = model.generate(
+            input_ids,
+            max_new_tokens=MAX_GEN_TOKENS * 8,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=[empty_id, result_end_id],
+            logits_processor=LogitsProcessorList([processor]),
+            streamer=streamer,
+        )
+    t_gen = time.time()
+
+    generated_ids = output[0][input_ids.shape[1]:]
+    raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
+
+    n_output = len(generated_ids)
+    tok_per_sec = n_output / (t_gen - t_tok) if (t_gen - t_tok) > 0 else 0
+    print(f"[inference] ◀ done: tokenize={t_tok-t0:.3f}s, generate={t_gen-t_tok:.3f}s "
+          f"({n_output} tokens, {tok_per_sec:.1f} tok/s)", flush=True)
+    return raw
+
+
+def generate_table_list(model, tokenizer) -> list[str]:
+    """Catalog: SchemaCatalogEntry::Scan(TABLE_ENTRY) — list table names."""
+    prompt = "<|query|>SHOW TABLES<|/query|> <|result|>"
+    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.TABLE_LIST)
+
+    # Parse: <|table|>name<|/table|><|table|>name2<|/table|>...<|empty|>
+    tables = []
+    remaining = raw
+    while "<|table|>" in remaining:
+        start = remaining.find("<|table|>") + len("<|table|>")
+        end = remaining.find("<|/table|>", start)
+        if end == -1:
+            break
+        tables.append(remaining[start:end].strip())
+        remaining = remaining[end + len("<|/table|>"):]
+    return tables
+
+
+def generate_column_list(model, tokenizer, table_name: str) -> list[dict]:
+    """Catalog: SchemaCatalogEntry::LookupEntry — get column definitions.
+
+    Returns list of {"name": str, "type": str, "primary_key": bool} matching
+    the SqlLlmColumnInfo struct in the DuckDB extension.
+    """
+    prompt = f"<|query|>DESCRIBE {table_name}<|/query|> <|result|>"
+    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.COLUMN_LIST)
+
+    # Parse: <|col|>name type [PRIMARY KEY]<|/col|>...<|empty|>
+    columns = []
+    remaining = raw
+    while "<|col|>" in remaining:
+        start = remaining.find("<|col|>") + len("<|col|>")
+        end = remaining.find("<|/col|>", start)
+        if end == -1:
+            break
+        col_def = remaining[start:end].strip()
+        remaining = remaining[end + len("<|/col|>"):]
+
+        parts = col_def.split()
+        if len(parts) >= 2:
+            columns.append({
+                "name": parts[0],
+                "type": parts[1],
+                "primary_key": "PRIMARY" in col_def.upper(),
+            })
+        elif len(parts) == 1:
+            columns.append({"name": parts[0], "type": "VARCHAR", "primary_key": False})
+    return columns
+
+
+def generate_rows(model, tokenizer, table: str, columns: list[str]) -> list[list[str]]:
+    """Catalog: SqlLlmScanFunc (via GetScanFunction) — generate row data.
+
+    Returns 2D list matching the extension's JsonGetRows() format.
+    """
+    cols = ", ".join(columns) if columns else "*"
+    prompt = f"<|query|>SELECT {cols} FROM {table}<|/query|> <|result|>"
+    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.ROW_DATA)
+
+    # Parse: <|row|><|col|>val<|/col|>...<|/row|>...<|empty|>
+    rows = []
+    remaining = raw
+    while "<|row|>" in remaining:
+        row_start = remaining.find("<|row|>") + len("<|row|>")
+        row_end = remaining.find("<|/row|>", row_start)
+        if row_end == -1:
+            break
+        row_content = remaining[row_start:row_end]
+        remaining = remaining[row_end + len("<|/row|>"):]
+
+        cols_vals = []
+        while "<|col|>" in row_content:
+            col_start = row_content.find("<|col|>") + len("<|col|>")
+            col_end = row_content.find("<|/col|>", col_start)
+            if col_end == -1:
+                break
+            val = row_content[col_start:col_end].strip()
+            if val == "<|null|>":
+                val = None
+            elif val == "<|empty|>":
+                val = ""
+            cols_vals.append(val)
+            row_content = row_content[col_end + len("<|/col|>"):]
+
+        if cols_vals:
+            rows.append(cols_vals)
+
+    return rows
 
 # ---------------------------------------------------------------------------
 # Fine-tuning
@@ -442,33 +595,53 @@ def finetune(model, tokenizer, training_data, time_budget=None,
 
         # --- End of epoch: check stopping conditions ---
 
-        # Convergence check: run validation queries (batched for efficiency)
+        # Convergence check: run validation queries using constrained generation
         if validation_queries:
             model.eval()
             correct = 0
-            BATCH_SIZE_VAL = 8
-            sqls = [sql for sql, _ in validation_queries]
-            expecteds = [expected for _, expected in validation_queries]
-
-            for vi in range(0, len(sqls), BATCH_SIZE_VAL):
-                batch_sqls = sqls[vi:vi + BATCH_SIZE_VAL]
-                batch_expected = expecteds[vi:vi + BATCH_SIZE_VAL]
+            for sql, expected in validation_queries:
                 try:
-                    raw_results = _batch_query(model, tokenizer, batch_sqls,
-                                               max_new_tokens=MAX_GEN_TOKENS)
-                    for raw, expected in zip(raw_results, batch_expected):
-                        result = _extract_single_value(raw)
-                        if _values_match(result, expected):
-                            correct += 1
-                except Exception:
-                    # Fallback to sequential if batching fails
-                    for sql, expected in zip(batch_sqls, batch_expected):
-                        try:
-                            result = query_single_value(model, tokenizer, sql)
+                    # Validation queries are single-value SELECTs like:
+                    #   SELECT col FROM table WHERE pk = val
+                    # Use ROW_DATA mode — result is one row with one col
+                    prompt = f"<|query|>{sql}<|/query|> <|result|>"
+                    _ensure_special_token_ids(tokenizer)
+                    input_device = model.get_input_embeddings().weight.device
+                    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(input_device)
+
+                    empty_id = _SPECIAL_TOKEN_IDS["<|empty|>"]
+                    result_end_id = _SPECIAL_TOKEN_IDS["<|/result|>"]
+
+                    processor = StructuredOutputProcessor(
+                        mode=OutputMode.ROW_DATA,
+                        special_token_ids=_SPECIAL_TOKEN_IDS,
+                        prompt_length=input_ids.shape[1],
+                    )
+
+                    with torch.inference_mode():
+                        output = model.generate(
+                            input_ids,
+                            max_new_tokens=MAX_GEN_TOKENS,
+                            do_sample=False,
+                            pad_token_id=tokenizer.pad_token_id,
+                            eos_token_id=[empty_id, result_end_id],
+                            logits_processor=LogitsProcessorList([processor]),
+                        )
+
+                    generated_ids = output[0][input_ids.shape[1]:]
+                    raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
+
+                    # Extract single value from <|row|><|col|>VALUE<|/col|><|/row|>
+                    if "<|col|>" in raw and "<|/col|>" in raw:
+                        start = raw.find("<|col|>") + len("<|col|>")
+                        end = raw.find("<|/col|>", start)
+                        if end > start:
+                            result = raw[start:end].strip()
                             if _values_match(result, expected):
                                 correct += 1
-                        except Exception:
-                            pass
+                except Exception:
+                    pass
+
             recall = correct / len(validation_queries)
             print(f"  Epoch {epoch}: validation recall {correct}/{len(validation_queries)} = {recall:.3f}")
             model.train()
@@ -535,238 +708,14 @@ def finetune(model, tokenizer, training_data, time_budget=None,
     return model
 
 # ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-def _get_special_token_id(tokenizer, token_str):
-    """Get the single token ID for a special token."""
-    ids = tokenizer.encode(token_str, add_special_tokens=False)
-    return ids[0] if ids else None
-
-
-def _generate_next_value(model, tokenizer, input_ids, stop_token_ids, max_tokens=32):
-    """Generate tokens freely until one of the stop tokens is produced.
-
-    Returns (generated_text, last_token_id, updated_input_ids).
-    """
-    generated = []
-    current_ids = input_ids
-
-    for _ in range(max_tokens):
-        with torch.inference_mode():
-            logits = model(input_ids=current_ids).logits[0, -1, :]
-        next_id = torch.argmax(logits).item()
-        generated.append(next_id)
-
-        if next_id in stop_token_ids:
-            break
-
-        current_ids = torch.cat([current_ids, torch.tensor([[next_id]], device=current_ids.device)], dim=1)
-
-    text = tokenizer.decode(generated[:-1] if generated and generated[-1] in stop_token_ids else generated,
-                             skip_special_tokens=False).strip()
-    last_id = generated[-1] if generated else None
-    all_ids = torch.cat([current_ids, torch.tensor([[generated[-1]]], device=current_ids.device)], dim=1) if generated else current_ids
-    return text, last_id, all_ids
-
-
-def _force_token(input_ids, token_id, device):
-    """Append a forced token to the input sequence."""
-    return torch.cat([input_ids, torch.tensor([[token_id]], device=device)], dim=1)
-
-
-def query(model, tokenizer, sql):
-    """Run a SQL query and return structured output.
-
-    Uses free generation (model generates structure tokens naturally from training)
-    then parses the result. Stops at <|empty|> or <|/result|>.
-
-    Returns raw text with structure tokens.
-    """
-
-    _ensure_special_token_ids(tokenizer)
-
-    t0 = time.time()
-    prompt = f"<|query|>{sql}<|/query|> <|result|>"
-    input_device = model.get_input_embeddings().weight.device
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(input_device)
-    t_tok = time.time()
-
-    empty_id = _SPECIAL_TOKEN_IDS.get("<|empty|>")
-    result_end_id = _SPECIAL_TOKEN_IDS.get("<|/result|>")
-
-    n_input = input_ids.shape[1]
-    print(f"[inference] ▶ {sql[:80]} ({n_input} input tokens, generating...)", flush=True)
-
-    # Stream tokens to stderr so they appear in real time
-    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
-
-    with torch.inference_mode():
-        output = model.generate(
-            input_ids,
-            max_new_tokens=MAX_GEN_TOKENS * 8,  # generous for multi-row
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=[empty_id, result_end_id],
-            streamer=streamer,
-        )
-    t_gen = time.time()
-
-    generated_ids = output[0][input_ids.shape[1]:]
-    raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
-    t_dec = time.time()
-
-    n_output = len(generated_ids)
-    tok_per_sec = n_output / (t_gen - t_tok) if (t_gen - t_tok) > 0 else 0
-    print(f"[inference] ◀ {sql[:60]}: tokenize={t_tok-t0:.3f}s, generate={t_gen-t_tok:.3f}s ({n_output} tokens, {tok_per_sec:.1f} tok/s), decode={t_dec-t_gen:.3f}s", flush=True)
-    return raw
-
-
-def _extract_single_value(raw):
-    """Extract a single scalar value from raw LLM output (shared by query_single_value and batch validation)."""
-    # Try structured format first: <|row|><|col|>VALUE<|/col|>...<|/row|>
-    if "<|col|>" in raw and "<|/col|>" in raw:
-        start = raw.find("<|col|>") + len("<|col|>")
-        end = raw.find("<|/col|>", start)
-        if end > start:
-            return raw[start:end].strip()
-    # Fallback: strip all special tokens and partial tokens (like trailing '<')
-    result = raw
-    for tok in SPECIAL_TOKENS + ["<|/result|>", "<|empty|>"]:
-        result = result.replace(tok, "")
-    # Strip any trailing partial special token markers
-    result = result.rstrip("<|>/")
-    return result.strip().split('\n')[0].strip()
-
-
-def query_single_value(model, tokenizer, sql):
-    """Run a SELECT and extract a single scalar value (for eval compatibility)."""
-    raw = query(model, tokenizer, sql)
-    return _extract_single_value(raw)
-
-
-def _batch_query(model, tokenizer, sqls, max_new_tokens=None):
-    """Run multiple queries in a single batched inference call.
-
-    Uses left-padding for correct causal LM batched generation.
-    """
-    if not sqls:
-        return []
-    if max_new_tokens is None:
-        max_new_tokens = MAX_GEN_TOKENS * 8
-
-    _ensure_special_token_ids(tokenizer)
-    input_device = model.get_input_embeddings().weight.device
-
-    prompts = [f"<|query|>{sql}<|/query|> <|result|>" for sql in sqls]
-
-    # Left-padding is required for batched causal LM generation
-    orig_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
-    encodings = tokenizer(prompts, return_tensors="pt", padding=True,
-                          truncation=True, max_length=MAX_SEQ_LEN)
-    tokenizer.padding_side = orig_padding_side
-    input_ids = encodings.input_ids.to(input_device)
-    attention_mask = encodings.attention_mask.to(input_device)
-
-    empty_id = _SPECIAL_TOKEN_IDS.get("<|empty|>")
-    result_end_id = _SPECIAL_TOKEN_IDS.get("<|/result|>")
-
-    with torch.inference_mode():
-        outputs = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=[empty_id, result_end_id],
-        )
-
-    results = []
-    for i in range(len(sqls)):
-        generated_ids = outputs[i][input_ids.shape[1]:]
-        # Strip padding tokens from output
-        mask = generated_ids != tokenizer.pad_token_id
-        generated_ids = generated_ids[mask]
-        raw = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
-        results.append(raw)
-
-    return results
-
-
-def parse_rows(raw_output):
-    """Parse structured output into list of rows (list of values).
-
-    Input: '<|row|><|col|>1<|/col|><|col|>Lion<|/col|><|/row|><|row|>...<|empty|>'
-    Output: [['1', 'Lion'], ['2', 'Penguin'], ...]
-    """
-    rows = []
-    remaining = raw_output
-    while "<|row|>" in remaining:
-        row_start = remaining.find("<|row|>") + len("<|row|>")
-        row_end = remaining.find("<|/row|>", row_start)
-        if row_end == -1:
-            break
-        row_content = remaining[row_start:row_end]
-        remaining = remaining[row_end + len("<|/row|>"):]
-
-        # Extract columns
-        cols = []
-        while "<|col|>" in row_content:
-            col_start = row_content.find("<|col|>") + len("<|col|>")
-            col_end = row_content.find("<|/col|>", col_start)
-            if col_end == -1:
-                break
-            val = row_content[col_start:col_end].strip()
-            if val == "<|null|>":
-                val = None
-            elif val == "<|empty|>":
-                val = ""
-            cols.append(val)
-            row_content = row_content[col_end + len("<|/col|>"):]
-
-        if cols:
-            rows.append(cols)
-
-    return rows
-
-
-def parse_tables(raw_output):
-    """Parse SHOW TABLES output into list of table names."""
-    tables = []
-    remaining = raw_output
-    while "<|table|>" in remaining:
-        start = remaining.find("<|table|>") + len("<|table|>")
-        end = remaining.find("<|/table|>", start)
-        if end == -1:
-            break
-        tables.append(remaining[start:end].strip())
-        remaining = remaining[end + len("<|/table|>"):]
-    return tables
-
-
-def parse_columns(raw_output):
-    """Parse DESCRIBE output into list of column definitions."""
-    cols = []
-    remaining = raw_output
-    while "<|col|>" in remaining:
-        start = remaining.find("<|col|>") + len("<|col|>")
-        end = remaining.find("<|/col|>", start)
-        if end == -1:
-            break
-        cols.append(remaining[start:end].strip())
-        remaining = remaining[end + len("<|/col|>"):]
-    return cols
-
-# ---------------------------------------------------------------------------
 # Database abstraction — SQL-like transaction model
 # ---------------------------------------------------------------------------
 
 class LLMDatabase:
     """An LLM used as a SQL database.
 
-    Supports CREATE TABLE, INSERT, COMMIT, and SELECT operations.
-    INSERTs are buffered until COMMIT triggers a fine-tuning run.
+    Buffers structured Table data (not SQL strings) until commit triggers
+    fine-tuning. Types match the DuckDB extension's SqlLlmColumnInfo.
 
     Two training modes:
     - Time-budget mode: pass train_time_budget to __init__. Used by autoresearch.
@@ -778,36 +727,51 @@ class LLMDatabase:
         self.model = model
         self.tokenizer = tokenizer
         self.train_time_budget = train_time_budget
-        self.pending_ddl = []
-        self.pending_inserts = []
+        # Buffers: table_name → Table object
+        self.pending_tables: dict[str, Table] = {}
 
-    def execute(self, sql):
-        sql_upper = sql.strip().upper()
-        if sql_upper.startswith("CREATE"):
-            self.pending_ddl.append(sql)
-        elif sql_upper.startswith("INSERT"):
-            self.pending_inserts.append(sql)
-        else:
-            raise ValueError(f"Unsupported statement: {sql[:50]}...")
+    @property
+    def pending_ddl(self):
+        """Number of pending table definitions (for health endpoint compat)."""
+        return [t for t in self.pending_tables.values()]
+
+    @property
+    def pending_inserts(self):
+        """Number of pending rows across all tables (for health endpoint compat)."""
+        return [row for t in self.pending_tables.values() for row in t.rows]
+
+    def create_table(self, name: str, columns: list[Column]):
+        """Buffer a table definition. Matches SchemaCatalogEntry::CreateTable."""
+        self.pending_tables[name] = Table(name=name, columns=columns, rows=[])
+
+    def insert_rows(self, table_name: str, col_names: list[str], rows: list[list]):
+        """Buffer rows for a table. Matches PlanInsert → Sink."""
+        if table_name not in self.pending_tables:
+            # Table not yet created via create_table — create with inferred VARCHAR columns
+            columns = [Column(name=n, dtype="VARCHAR") for n in col_names]
+            self.pending_tables[table_name] = Table(name=table_name, columns=columns, rows=[])
+
+        table = self.pending_tables[table_name]
+        for row_values in rows:
+            row = dict(zip(col_names, row_values))
+            table.rows.append(row)
 
     def commit(self, progress_callback=None):
-        if not self.pending_ddl and not self.pending_inserts:
+        tables = list(self.pending_tables.values())
+        if not tables:
             print("COMMIT: nothing to commit")
             return False
 
-        print(f"COMMIT: {len(self.pending_ddl)} DDL + {len(self.pending_inserts)} INSERTs")
+        total_rows = sum(len(t.rows) for t in tables)
+        print(f"COMMIT: {len(tables)} tables, {total_rows} rows")
 
-        # Parse pending SQL into Table objects
-        tables = _parse_pending_to_tables(self.pending_ddl, self.pending_inserts)
         training_data = format_training_data(tables, self.tokenizer)
 
         if self.train_time_budget:
-            # Autoresearch mode: fixed time budget
             self.model = finetune(self.model, self.tokenizer, training_data,
                                   time_budget=self.train_time_budget,
                                   progress_callback=progress_callback)
         else:
-            # Real usage: train until convergence
             validation_queries = []
             for table in tables:
                 validation_queries.extend(generate_select_queries(
@@ -818,41 +782,194 @@ class LLMDatabase:
                                   validation_queries=validation_queries,
                                   progress_callback=progress_callback)
 
-        self.pending_ddl.clear()
-        self.pending_inserts.clear()
+        self.pending_tables.clear()
         print("COMMIT: done")
         return True
 
-    def select(self, sql):
-        return query_single_value(self.model, self.tokenizer, sql)
+    def rollback(self):
+        self.pending_tables.clear()
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Evaluation — end-to-end through DuckDB
+# ---------------------------------------------------------------------------
+
+EXT_PATH = os.path.join(os.path.dirname(__file__), "ext", "build", "sql_llm.duckdb_extension")
+SERVER_HOST = "0.0.0.0"
+SERVER_PORT = 8000
+SERVER_URL = f"http://localhost:{SERVER_PORT}"
+
+
+def _start_server_background(llm_db):
+    """Start the FastAPI server in a background thread, sharing the LLMDatabase instance."""
+    import uvicorn
+    import llm_server
+
+    # Inject the LLMDatabase instance into the server module
+    llm_server.db = llm_db
+    llm_server.tokenizer_ref = llm_db.tokenizer
+    llm_server.model_ref = llm_db.model
+
+    config = uvicorn.Config(
+        llm_server.app,
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config)
+
+    # Run in a daemon thread so it dies with the main process
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    # Wait for server to be ready
+    import requests
+    for _ in range(50):
+        try:
+            r = requests.get(f"{SERVER_URL}/health", timeout=1)
+            if r.status_code == 200:
+                print(f"Server ready at {SERVER_URL}", flush=True)
+                return server
+        except Exception:
+            pass
+        time.sleep(0.1)
+    raise RuntimeError("Server failed to start")
+
+
+def _connect_duckdb():
+    """Connect DuckDB with the sql_llm extension loaded and attached."""
+    import duckdb
+
+    conn = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+    conn.execute(f"LOAD '{EXT_PATH}'")
+    conn.execute(f"ATTACH '{SERVER_URL}' AS llm (TYPE SQL_LLM, READ_WRITE)")
+    return conn
+
+
+def _sql_value_duckdb(val, dtype):
+    """Format a value for DuckDB SQL. Same as prepare._sql_value but accessible here."""
+    if val is None:
+        return "NULL"
+    if dtype in ("INTEGER", "FLOAT", "BIGINT", "DOUBLE"):
+        return str(val)
+    # String: escape single quotes
+    return "'" + str(val).replace("'", "''") + "'"
+
+
+def evaluate_recall_duckdb(conn, datasets, max_per_dataset=50, seed=5366):
+    """Evaluate recall by running SELECT queries through DuckDB.
+
+    Every query flows: DuckDB → Extension → HTTP → Server → LLM inference.
+    Results come back as DuckDB result sets — the real production path.
+    """
+    rng = random.Random(seed)
+    total_correct = 0
+    total_queries = 0
+    per_dataset = {}
+
+    for ds in datasets:
+        queries = []
+        for table in ds.tables:
+            pk_cols = [c for c in table.columns if c.primary_key]
+            if not pk_cols:
+                continue
+            pk_col = pk_cols[0]
+            for row in table.rows:
+                pk_val = row.get(pk_col.name)
+                for col in table.columns:
+                    if col.primary_key:
+                        continue
+                    val = row.get(col.name)
+                    if val is None:
+                        continue
+                    queries.append((table.name, col, pk_col, pk_val, str(val)))
+
+        if len(queries) > max_per_dataset:
+            queries = rng.sample(queries, max_per_dataset)
+
+        ds_correct = 0
+        for table_name, col, pk_col, pk_val, expected in queries:
+            try:
+                pk_literal = _sql_value_duckdb(pk_val, pk_col.dtype)
+                sql = f"SELECT {col.name} FROM llm.{table_name} WHERE {pk_col.name} = {pk_literal}"
+                result = conn.execute(sql).fetchone()
+                if result is not None:
+                    predicted = str(result[0]).strip()
+                    if _values_match(predicted, expected):
+                        ds_correct += 1
+            except Exception as e:
+                print(f"  [eval error] {e}", flush=True)
+
+        ds_total = len(queries)
+        per_dataset[ds.name] = ds_correct / ds_total if ds_total > 0 else 0.0
+        total_correct += ds_correct
+        total_queries += ds_total
+        print(f"  {ds.name}: {ds_correct}/{ds_total} = {per_dataset[ds.name]:.3f}", flush=True)
+
+    overall_recall = total_correct / total_queries if total_queries > 0 else 0.0
+    return {
+        "overall_recall": overall_recall,
+        "per_dataset": per_dataset,
+        "total_queries": total_queries,
+        "total_correct": total_correct,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main — end-to-end: load model, start server, drive everything through DuckDB
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     t0 = time.time()
 
+    # 1. Load model + tokenizer
     model, tokenizer = load_model_and_tokenizer()
 
     datasets = load_datasets()
     print(f"Loaded {len(datasets)} datasets")
 
-    train_budget = TIME_BUDGET * TRAIN_TIME_FRACTION
-    db = LLMDatabase(model, tokenizer, train_budget)
+    # 2. Create LLMDatabase and start the HTTP server in-process
+    train_budget_str = os.environ.get("TRAIN_BUDGET")
+    train_budget = int(train_budget_str) if train_budget_str else int(TIME_BUDGET * TRAIN_TIME_FRACTION)
+    llm_db = LLMDatabase(model, tokenizer, train_time_budget=train_budget)
+
+    print("Starting server...", flush=True)
+    _start_server_background(llm_db)
+
+    # 3. Connect DuckDB through the extension
+    print("Connecting DuckDB...", flush=True)
+    conn = _connect_duckdb()
+    print("DuckDB connected, extension loaded, catalog attached.", flush=True)
+
+    # 4. CREATE TABLE + INSERT + COMMIT through DuckDB
+    # Use USE to set default catalog so all statements target the llm catalog.
+    # Wrap everything in a single explicit transaction so CommitTransaction
+    # (which triggers fine-tuning) is only called once at the end.
+    conn.execute("USE llm")
+
+    # DuckDB needs an explicit transaction to batch CREATE/INSERT and defer
+    # the catalog's CommitTransaction (which triggers fine-tuning) until COMMIT.
+    conn.execute("BEGIN TRANSACTION")
 
     for ds in datasets:
         for ddl in generate_schema_ddl(ds):
-            db.execute(ddl)
-        for insert in generate_inserts(ds):
-            db.execute(insert)
-    print(f"Buffered {len(db.pending_ddl)} DDL + {len(db.pending_inserts)} INSERTs")
+            conn.execute(ddl)
 
-    db.commit()
+        for insert_sql in generate_inserts(ds):
+            conn.execute(insert_sql)
 
-    print("Evaluating recall...")
-    results = evaluate_recall(db.select, datasets)
+    total_rows = sum(len(t.rows) for t in llm_db.pending_tables.values())
+    print(f"Buffered via DuckDB: {len(llm_db.pending_tables)} tables, {total_rows} rows")
+
+    # 5. COMMIT triggers fine-tuning (DuckDB → extension CommitTransaction → POST /commit)
+    print("Committing (fine-tuning)...", flush=True)
+    conn.execute("COMMIT")
+
+    # 6. Evaluate recall through DuckDB (flows: DuckDB → extension → HTTP → server → LLM inference)
+    print("Evaluating recall through DuckDB...", flush=True)
+    results = evaluate_recall_duckdb(conn, datasets)
+
+    conn.close()
 
     elapsed = time.time() - t0
     peak_vram = torch.cuda.max_memory_allocated() / 1e6

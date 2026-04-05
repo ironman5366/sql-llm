@@ -36,7 +36,7 @@ fi
 # Build DuckDB static libs if missing (or if --full is passed)
 if [ ! -f "$BUILD/src/libduckdb_static.a" ] || [ "${1:-}" = "--full" ]; then
     echo "Building DuckDB static libs (this takes a while the first time)..."
-    GEN=ninja make release
+    MAKEFLAGS="-j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" GEN=ninja make release
     echo ""
 fi
 

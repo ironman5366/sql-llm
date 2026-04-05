@@ -514,25 +514,38 @@ struct SqlLlmScanState : public GlobalTableFunctionState {
 	bool fetched = false;
 	idx_t current_row = 0;
 	std::vector<std::vector<std::string>> rows;  // use std:: explicitly for JSON helper compatibility
+	vector<column_t> projected_columns;           // which bind_data columns are needed (projection pushdown)
 };
 
 static unique_ptr<GlobalTableFunctionState> SqlLlmScanInit(ClientContext &context,
                                                             TableFunctionInitInput &input) {
-	return make_uniq<SqlLlmScanState>();
+	auto state = make_uniq<SqlLlmScanState>();
+	// Store projected column indices for use in the scan function
+	state->projected_columns = input.column_ids;
+	return std::move(state);
 }
 
 static void SqlLlmScanFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<SqlLlmScanBindData>();
 	auto &state = input.global_state->Cast<SqlLlmScanState>();
 
+	auto &column_ids = state.projected_columns;
+
 	if (!state.fetched) {
 		state.fetched = true;
 
-		// Build structured query JSON
+		// Only request the projected columns from the server
+		std::vector<std::string> projected_names;
+		for (auto &col_id : column_ids) {
+			if (col_id < bind_data.column_names.size()) {
+				projected_names.push_back(bind_data.column_names[col_id]);
+			}
+		}
+
 		std::string body = "{\"table\": \"" + JsonEscape(bind_data.table_name) + "\", \"columns\": [";
-		for (idx_t i = 0; i < bind_data.column_names.size(); i++) {
+		for (idx_t i = 0; i < projected_names.size(); i++) {
 			if (i > 0) body += ", ";
-			body += "\"" + JsonEscape(bind_data.column_names[i]) + "\"";
+			body += "\"" + JsonEscape(projected_names[i]) + "\"";
 		}
 		body += "]}";
 
@@ -540,7 +553,6 @@ static void SqlLlmScanFunc(ClientContext &context, TableFunctionInput &input, Da
 			ProgressSpinner spinner("Querying '" + bind_data.table_name + "' via LLM...");
 			std::string response = HttpPost(bind_data.server_url + "/query", body);
 			auto parsed = JsonGetRows(response);
-			// Convert std::vector to our rows format
 			for (auto &r : parsed) {
 				state.rows.push_back(r);
 			}
@@ -553,27 +565,27 @@ static void SqlLlmScanFunc(ClientContext &context, TableFunctionInput &input, Da
 	}
 
 	idx_t count = 0;
-	idx_t num_cols = bind_data.column_names.size();
+	idx_t num_output_cols = column_ids.size();
 
 	while (state.current_row < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = state.rows[state.current_row];
-		for (idx_t col = 0; col < num_cols; col++) {
-			if (col < row.size() && !row[col].empty()) {
-				auto &target_type = bind_data.column_types[col];
+		for (idx_t out_col = 0; out_col < num_output_cols; out_col++) {
+			auto bind_col = column_ids[out_col];
+			// row[out_col] corresponds to the out_col-th projected column
+			if (out_col < row.size() && !row[out_col].empty()) {
+				auto &target_type = bind_data.column_types[bind_col];
 				if (target_type == LogicalType::VARCHAR) {
-					output.data[col].SetValue(count, Value(row[col]));
+					output.data[out_col].SetValue(count, Value(row[out_col]));
 				} else {
-					// Try to convert the string to the target type
-					Value val(row[col]);
+					Value val(row[out_col]);
 					if (val.DefaultTryCastAs(target_type)) {
-						output.data[col].SetValue(count, val);
+						output.data[out_col].SetValue(count, val);
 					} else {
-						// Cast failed — set NULL
-						output.data[col].SetValue(count, Value(target_type));
+						output.data[out_col].SetValue(count, Value(target_type));
 					}
 				}
 			} else {
-				output.data[col].SetValue(count, Value(bind_data.column_types[col]));
+				output.data[out_col].SetValue(count, Value(bind_data.column_types[bind_col]));
 			}
 		}
 		state.current_row++;
