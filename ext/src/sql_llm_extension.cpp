@@ -162,7 +162,9 @@ static std::string HttpPostStreaming(const std::string &url, const std::string &
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, StreamWriteCallback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600L);  // 1 hour for training
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600L);       // 1 hour for training
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 0L);  // disable stall detection
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 0L);
 	CURLcode res = curl_easy_perform(curl);
 	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
@@ -1489,9 +1491,12 @@ unique_ptr<Catalog> SqlLlmCatalog::Attach(optional_ptr<StorageExtensionInfo> sto
                                            const string &name, AttachInfo &info, AttachOptions &options) {
 	string server_url = "http://localhost:8000";
 
-	// Check for server_url in attach options
+	// Check for server/server_url in attach options
 	if (info.options.count("server_url")) {
 		server_url = info.options["server_url"].ToString();
+	}
+	if (info.options.count("server")) {
+		server_url = info.options["server"].ToString();
 	}
 	// Also check path — if non-empty, treat as server URL
 	if (!info.path.empty()) {

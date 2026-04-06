@@ -17,3 +17,6 @@ ext/duckdb_unittest_tempdir/
 ext/testext/
 server.log
 **/server.log
+server_gpu*.log
+logs/
+autoresearch_results.jsonl

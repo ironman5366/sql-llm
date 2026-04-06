@@ -28,7 +28,6 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 
 TIME_BUDGET = 600  # 10 minutes total for fine-tuning + inference + evaluation
-MAX_EVAL_QUERIES_PER_DATASET = 50  # cap evaluation queries per dataset for practical runtime
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "gpt-oss-20b")
 DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
 KAGGLE_DIR = os.path.join(DATASETS_DIR, "kaggle")
@@ -326,18 +325,13 @@ def _values_match(predicted: str, expected: str, dtype: str = "VARCHAR") -> bool
 def evaluate_recall(
     query_fn: Callable[[str], str],
     datasets: list[Dataset],
-    max_per_dataset: int = MAX_EVAL_QUERIES_PER_DATASET,
     seed: int = 5366,
 ) -> dict:
-    """Evaluate recall across all datasets.
-
-    For large datasets, samples up to max_per_dataset queries per dataset
-    to keep evaluation practical within the time budget.
+    """Evaluate recall across all datasets. Queries every row.
 
     Args:
         query_fn: function(sql_string) -> result_string
         datasets: list of datasets to evaluate
-        max_per_dataset: max queries to evaluate per dataset
         seed: random seed for reproducible sampling
 
     Returns:
@@ -347,8 +341,6 @@ def evaluate_recall(
             total_queries: int
             total_correct: int
     """
-    rng = random.Random(seed)
-
     total_correct = 0
     total_queries = 0
     per_dataset = {}
@@ -357,8 +349,6 @@ def evaluate_recall(
     all_queries = []
     for dataset in datasets:
         queries = generate_select_queries(dataset)
-        if len(queries) > max_per_dataset:
-            queries = rng.sample(queries, max_per_dataset)
         all_queries.append((dataset.name, queries))
 
     total_eval = sum(len(qs) for _, qs in all_queries)

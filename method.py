@@ -104,6 +104,11 @@ def setup_training(model, tokenizer):
         for param in model.parameters():
             param.requires_grad = True
 
+        # Enable gradient checkpointing to reduce activation memory (~60% savings)
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            print("Gradient checkpointing enabled")
+
         # Optionally freeze early transformer layers (keeps embeddings trainable)
         if FREEZE_LAYERS > 0:
             frozen_count = 0
@@ -307,9 +312,6 @@ def format_training_data(tables, tokenizer):
 
     # --- 7. Comparison query permutations (for numeric columns) ---
     # Generate synthetic thresholds for numeric comparisons.
-    # Budget: cap at ~200 comparison examples per table to avoid explosion
-    # on wide tables (15+ columns).
-    MAX_COMPARISON_EXAMPLES_PER_TABLE = 200
     for table, rows in all_tables:
         if not rows:
             continue
@@ -318,8 +320,6 @@ def format_training_data(tables, tokenizer):
 
         comparison_count = 0
         for num_col in numeric_cols:
-            if comparison_count >= MAX_COMPARISON_EXAMPLES_PER_TABLE:
-                break
             vals = []
             for row in rows:
                 v = row.get(num_col.name)
@@ -352,16 +352,12 @@ def format_training_data(tables, tokenizer):
                 thresholds.add(vals[-1][0] + 10)
 
             for threshold in sorted(thresholds):
-                if comparison_count >= MAX_COMPARISON_EXAMPLES_PER_TABLE:
-                    break
                 for op, op_fn in [
                     (">", lambda v, t: v > t),
                     ("<", lambda v, t: v < t),
                     (">=", lambda v, t: v >= t),
                     ("<=", lambda v, t: v <= t),
                 ]:
-                    if comparison_count >= MAX_COMPARISON_EXAMPLES_PER_TABLE:
-                        break
                     matching = [r for v, r in vals if op_fn(v, threshold)]
                     if len(matching) > 10:
                         continue
@@ -388,8 +384,6 @@ def format_training_data(tables, tokenizer):
                             col_orderings.append(duckdb_order)
 
                         for col_order in col_orderings:
-                            if comparison_count >= MAX_COMPARISON_EXAMPLES_PER_TABLE:
-                                break
                             result_rows = []
                             for r in matching:
                                 row_parts = []
@@ -483,17 +477,12 @@ def format_training_data(tables, tokenizer):
                 if len(q_tok) + len(a_tok) <= MAX_SEQ_LEN:
                     data.append((q_tok + a_tok, [0] * len(q_tok) + [1] * len(a_tok)))
 
-    # Cap total training examples to keep training time reasonable
-    MAX_TRAINING_EXAMPLES = 2000
-    if len(data) > MAX_TRAINING_EXAMPLES:
-        # Keep all non-comparison items (they're first in the list), sample comparisons
-        print(f"Capping training data from {len(data)} to {MAX_TRAINING_EXAMPLES} examples")
-        random.shuffle(data)
-        data = data[:MAX_TRAINING_EXAMPLES]
-
-    if REPEAT_FACTOR > 1:
-        data = data * REPEAT_FACTOR
-        print(f"Formatted {len(data)} training items ({len(data)//REPEAT_FACTOR} unique x {REPEAT_FACTOR})")
+    # No cap on training examples — the model should see everything.
+    # Repeat small datasets so the model sees each example multiple times.
+    repeat = REPEAT_FACTOR if len(data) < 3000 else 1
+    if repeat > 1:
+        data = data * repeat
+        print(f"Formatted {len(data)} training items ({len(data)//repeat} unique x {repeat})")
     else:
         print(f"Formatted {len(data)} training items")
     return data
@@ -604,7 +593,7 @@ class StructuredOutputProcessor(LogitsProcessor):
 # ---------------------------------------------------------------------------
 
 def _generate_constrained(model, tokenizer, prompt: str, mode: OutputMode,
-                          max_tokens: int | None = None) -> str:
+                          max_tokens: int | None = None, log_file=None) -> str:
     """Core generation with constrained decoding. Returns raw token string.
 
     Args:
@@ -652,13 +641,28 @@ def _generate_constrained(model, tokenizer, prompt: str, mode: OutputMode,
     tok_per_sec = n_output / (t_gen - t_tok) if (t_gen - t_tok) > 0 else 0
     print(f"[inference] ◀ done: tokenize={t_tok-t0:.3f}s, generate={t_gen-t_tok:.3f}s "
           f"({n_output} tokens, {tok_per_sec:.1f} tok/s)", flush=True)
+
+    if log_file is not None:
+        import datetime as _dt
+        log_file.write(json.dumps({
+            "timestamp": _dt.datetime.now().isoformat(),
+            "prompt": prompt,
+            "response": raw,
+            "mode": mode.value,
+            "input_tokens": n_input,
+            "output_tokens": n_output,
+            "tokenize_time_s": round(t_tok - t0, 4),
+            "generate_time_s": round(t_gen - t_tok, 4),
+        }) + "\n")
+        log_file.flush()
+
     return raw
 
 
-def generate_table_list(model, tokenizer) -> list[str]:
+def generate_table_list(model, tokenizer, log_file=None) -> list[str]:
     """Catalog: SchemaCatalogEntry::Scan(TABLE_ENTRY) — list table names."""
     prompt = "<|query|>SHOW TABLES<|/query|> <|result|>"
-    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.TABLE_LIST)
+    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.TABLE_LIST, log_file=log_file)
 
     # Parse: <|table|>name<|/table|><|table|>name2<|/table|>...<|empty|>
     tables = []
@@ -673,14 +677,14 @@ def generate_table_list(model, tokenizer) -> list[str]:
     return tables
 
 
-def generate_column_list(model, tokenizer, table_name: str) -> list[dict]:
+def generate_column_list(model, tokenizer, table_name: str, log_file=None) -> list[dict]:
     """Catalog: SchemaCatalogEntry::LookupEntry — get column definitions.
 
     Returns list of {"name": str, "type": str, "primary_key": bool} matching
     the SqlLlmColumnInfo struct in the DuckDB extension.
     """
     prompt = f"<|query|>DESCRIBE {table_name}<|/query|> <|result|>"
-    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.COLUMN_LIST)
+    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.COLUMN_LIST, log_file=log_file)
 
     # Parse: <|col|>name type [PRIMARY KEY]<|/col|>...<|empty|>
     columns = []
@@ -706,7 +710,8 @@ def generate_column_list(model, tokenizer, table_name: str) -> list[dict]:
 
 
 def generate_rows(model, tokenizer, table: str, columns: list[str],
-                   filters: list[tuple[str, str, str]] | None = None) -> list[list[str]]:
+                   filters: list[tuple[str, str, str]] | None = None,
+                   log_file=None) -> list[list[str]]:
     """Catalog: SqlLlmScanFunc (via GetScanFunction) — generate row data.
 
     Args:
@@ -729,16 +734,22 @@ def generate_rows(model, tokenizer, table: str, columns: list[str],
         prompt = f"<|query|>SELECT {cols} FROM {table} WHERE {where_clause}<|/query|> <|result|>"
     else:
         prompt = f"<|query|>SELECT {cols} FROM {table}<|/query|> <|result|>"
-    # Estimate max tokens needed: ~10 tokens per column per row, assume up to 50 rows
+    # Estimate max tokens needed based on query type.
     # Each column value is ~3 tokens + 2 for <|col|><|/col|> = 5.
     # Each row has n_cols × 5 + 2 (<|row|><|/row|>) tokens.
-    # For wide tables, we need much more than the default 256 tokens.
     n_cols = len(columns) if columns else 10
     estimated_tokens_per_row = n_cols * 5 + 4
-    max_tokens = max(256, estimated_tokens_per_row * 50)  # up to 50 rows
+    if filters:
+        # Filtered queries: equality filters expect few rows, range filters expect more
+        has_equality = any(op == "=" for _, op, _ in filters)
+        max_rows_estimate = 5 if has_equality else 30
+        max_tokens = max(256, estimated_tokens_per_row * max_rows_estimate + 20)
+    else:
+        # Unfiltered: up to 50 rows
+        max_tokens = max(256, estimated_tokens_per_row * 50)
     max_tokens = min(max_tokens, 4096)  # cap at 4K to avoid OOM
 
-    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.ROW_DATA, max_tokens=max_tokens)
+    raw = _generate_constrained(model, tokenizer, prompt, OutputMode.ROW_DATA, max_tokens=max_tokens, log_file=log_file)
 
     # Parse: <|row|><|col|>val<|/col|>...<|/row|>...<|empty|>
     rows = []
@@ -934,8 +945,24 @@ def finetune(model, tokenizer, training_data, time_budget=None,
         pbar = tqdm(total=max_epochs, unit="ep", desc="Fine-tuning",
                     bar_format="{l_bar}{bar}| {n}/{total} epochs [{elapsed}<{remaining}, {postfix}]")
 
-    BATCH_SIZE = 64
-    GRAD_ACCUM_STEPS = 1
+    # Dynamic batch sizing: scale down for long sequences (wide tables)
+    avg_seq_len = sum(len(t) for t, _ in training_data if len(t) >= 2) / max(len(training_data), 1)
+    if avg_seq_len > 300:
+        BATCH_SIZE = 4
+        GRAD_ACCUM_STEPS = 16
+    elif avg_seq_len > 150:
+        BATCH_SIZE = 8
+        GRAD_ACCUM_STEPS = 8
+    elif avg_seq_len > 80:
+        BATCH_SIZE = 16
+        GRAD_ACCUM_STEPS = 4
+    elif avg_seq_len > 40:
+        BATCH_SIZE = 32
+        GRAD_ACCUM_STEPS = 2
+    else:
+        BATCH_SIZE = 64
+        GRAD_ACCUM_STEPS = 1
+    print(f"Batch config: avg_seq_len={avg_seq_len:.0f}, batch_size={BATCH_SIZE}, grad_accum={GRAD_ACCUM_STEPS}", flush=True)
     optimizer.zero_grad(set_to_none=True)
 
     converged = False
@@ -991,21 +1018,30 @@ def finetune(model, tokenizer, training_data, time_budget=None,
                 padded_target[b, :seq_len] = t_tensor[1:]
                 padded_mask[b, :seq_len] = m_tensor[1:]
 
-            outputs = model(input_ids=padded_input)
-            logits = outputs.logits
-            per_token_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), padded_target.view(-1), reduction='none'
-            )
-            loss = (per_token_loss * padded_mask.view(-1)).sum() / padded_mask.sum().clamp(min=1)
+            try:
+                outputs = model(input_ids=padded_input)
+                logits = outputs.logits
+                per_token_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)), padded_target.view(-1), reduction='none'
+                )
+                loss = (per_token_loss * padded_mask.view(-1)).sum() / padded_mask.sum().clamp(min=1)
 
-            # Add EWC penalty to protect previously learned knowledge
-            if ewc_fisher is not None and ewc_old_params is not None:
-                ewc_loss = ewc_penalty(model, ewc_fisher, ewc_old_params)
-                loss = loss + (ewc_lambda / 2) * ewc_loss
+                # Add EWC penalty to protect previously learned knowledge
+                if ewc_fisher is not None and ewc_old_params is not None:
+                    ewc_loss = ewc_penalty(model, ewc_fisher, ewc_old_params)
+                    loss = loss + (ewc_lambda / 2) * ewc_loss
 
-            loss = loss / GRAD_ACCUM_STEPS
+                loss = loss / GRAD_ACCUM_STEPS
 
-            loss.backward()
+                loss.backward()
+            except torch.cuda.OutOfMemoryError:
+                print(f"OOM at batch_size={len(batch_tokens)}, seq_len={max_len}. "
+                      f"Halving batch size.", flush=True)
+                torch.cuda.empty_cache()
+                optimizer.zero_grad(set_to_none=True)
+                BATCH_SIZE = max(1, BATCH_SIZE // 2)
+                GRAD_ACCUM_STEPS = GRAD_ACCUM_STEPS * 2
+                continue
             step += 1
 
             if step % GRAD_ACCUM_STEPS == 0:
@@ -1024,6 +1060,16 @@ def finetune(model, tokenizer, training_data, time_budget=None,
                                  bs=len(batch_tokens))
                 pbar.refresh()
 
+                # Fire progress callback every batch to keep streaming connection alive
+                if progress_callback and step % 5 == 0:
+                    elapsed = time.time() - t0
+                    if time_budget:
+                        pct = int(min(100, 100 * elapsed / time_budget))
+                    else:
+                        pct = int(min(99, 100 * epoch / max_epochs))
+                    avg = total_loss / max(step, 1)
+                    progress_callback(epoch, max_epochs, avg, pct)
+
         # Step the LR scheduler after each epoch
         scheduler.step()
 
@@ -1036,10 +1082,10 @@ def finetune(model, tokenizer, training_data, time_budget=None,
         # Skip validation until loss is low enough (training isn't ready for inference checks).
         should_validate = (
             validation_queries and
-            avg_epoch_loss < 0.10 and
             (epoch % VALIDATION_INTERVAL == 0 or epoch == max_epochs)
         )
         if should_validate:
+            print(f"  Epoch {epoch}: avg_epoch_loss={avg_epoch_loss:.4f}, running validation...", flush=True)
             model.eval()
             correct = 0
             for sql, expected in validation_queries:
@@ -1121,7 +1167,8 @@ def finetune(model, tokenizer, training_data, time_budget=None,
         elapsed = time.time() - t0
         if time_budget and elapsed >= time_budget:
             break
-        if elapsed >= MAX_TRAIN_TIME:
+        if not validation_queries and elapsed >= MAX_TRAIN_TIME:
+            # Only enforce time cap in time-budget mode, not convergence mode
             print(f"  Training time cap ({MAX_TRAIN_TIME}s) reached at epoch {epoch}")
             break
 
@@ -1140,6 +1187,10 @@ def finetune(model, tokenizer, training_data, time_budget=None,
     print(f"Fine-tuning done: {step} steps, {epoch} epochs, avg_loss={avg_loss:.4f}, "
           f"time={elapsed:.1f}s, stopped={stop_reason}")
     model.eval()
+
+    # Disable gradient checkpointing for fast inference
+    if hasattr(model, 'gradient_checkpointing_disable'):
+        model.gradient_checkpointing_disable()
 
     # Free optimizer/gradient memory before inference.
     # Training allocates ~2x model size for Adam states + gradients.
@@ -1162,7 +1213,7 @@ def finetune(model, tokenizer, training_data, time_budget=None,
 # Database abstraction — SQL-like transaction model
 # ---------------------------------------------------------------------------
 
-def _replay_existing_knowledge(model, tokenizer) -> list[Table]:
+def _replay_existing_knowledge(model, tokenizer, log_file=None) -> list[Table]:
     """Sample the model's existing knowledge before fine-tuning.
 
     Queries the model for: SHOW TABLES → DESCRIBE each → SELECT * each.
@@ -1173,7 +1224,7 @@ def _replay_existing_knowledge(model, tokenizer) -> list[Table]:
     replayed_tables = []
 
     # 1. Get existing table names
-    table_names = generate_table_list(model, tokenizer)
+    table_names = generate_table_list(model, tokenizer, log_file=log_file)
     if not table_names:
         print("REPLAY: no existing tables found", flush=True)
         return []
@@ -1182,7 +1233,7 @@ def _replay_existing_knowledge(model, tokenizer) -> list[Table]:
 
     for tbl_name in table_names:
         # 2. Get schema for each table
-        col_defs = generate_column_list(model, tokenizer, tbl_name)
+        col_defs = generate_column_list(model, tokenizer, tbl_name, log_file=log_file)
         if not col_defs:
             print(f"REPLAY: skipping {tbl_name} — no schema", flush=True)
             continue
@@ -1198,7 +1249,7 @@ def _replay_existing_knowledge(model, tokenizer) -> list[Table]:
 
         # 3. Get all rows via SELECT *
         col_names = [c.name for c in columns]
-        rows_raw = generate_rows(model, tokenizer, tbl_name, col_names)
+        rows_raw = generate_rows(model, tokenizer, tbl_name, col_names, log_file=log_file)
 
         rows = []
         for row_vals in rows_raw:
@@ -1327,6 +1378,11 @@ class LLMDatabase:
         # EWC state for anti-forgetting regularization
         self.ewc_fisher: dict | None = None
         self.ewc_old_params: dict | None = None
+        # LLM interaction log
+        import datetime as _dt
+        os.makedirs("logs", exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.llm_log = open(f"logs/llm_interactions_{ts}.jsonl", "a")
 
     @property
     def pending_ddl(self):
@@ -1399,7 +1455,7 @@ class LLMDatabase:
               f"{len(self.pending_updates)} updates, {len(self.pending_deletes)} deletes")
 
         # Anti-forgetting: replay existing knowledge from model weights
-        existing_tables = _replay_existing_knowledge(self.model, self.tokenizer)
+        existing_tables = _replay_existing_knowledge(self.model, self.tokenizer, log_file=self.llm_log)
 
         # Merge existing + new inserts
         all_tables = _merge_tables(existing_tables, new_tables)
@@ -1473,14 +1529,14 @@ class LLMDatabase:
                         first_pk = str(table.rows[0].get(pk_cols[0].name, ""))
                         validation_queries.append((f"SELECT {col_list} FROM {table.name}", first_pk))
 
-            # Cap validation queries to keep convergence checks fast
-            MAX_VALIDATION_QUERIES = 30
-            if len(validation_queries) > MAX_VALIDATION_QUERIES:
-                # Always keep SHOW TABLES and DESCRIBE (first few), sample the rest
+            # Sample validation queries for convergence check (not an eval cap —
+            # just keeps the mid-training convergence check fast enough to be useful).
+            # A 100-query sample is statistically sufficient to detect convergence.
+            if len(validation_queries) > 100:
                 important = [q for q in validation_queries if q[0].startswith("SHOW") or q[0].startswith("DESCRIBE")]
                 rest = [q for q in validation_queries if q not in important]
                 random.shuffle(rest)
-                validation_queries = important + rest[:MAX_VALIDATION_QUERIES - len(important)]
+                validation_queries = important + rest[:100 - len(important)]
             print(f"COMMIT: {len(validation_queries)} validation queries for convergence check")
             self.model = finetune(self.model, self.tokenizer, training_data,
                                   validation_queries=validation_queries,
@@ -1687,13 +1743,13 @@ def _sql_value_duckdb(val, dtype):
     return "'" + str(val).replace("'", "''") + "'"
 
 
-def evaluate_recall_duckdb(conn, datasets, max_per_dataset=50, seed=5366):
+def evaluate_recall_duckdb(conn, datasets, seed=5366):
     """Evaluate recall by running SELECT queries through DuckDB.
 
     Every query flows: DuckDB → Extension → HTTP → Server → LLM inference.
     Results come back as DuckDB result sets — the real production path.
+    Queries every single row.
     """
-    rng = random.Random(seed)
     total_correct = 0
     total_queries = 0
     per_dataset = {}
@@ -1714,9 +1770,6 @@ def evaluate_recall_duckdb(conn, datasets, max_per_dataset=50, seed=5366):
                     if val is None:
                         continue
                     queries.append((table.name, col, pk_col, pk_val, str(val)))
-
-        if len(queries) > max_per_dataset:
-            queries = rng.sample(queries, max_per_dataset)
 
         ds_correct = 0
         for table_name, col, pk_col, pk_val, expected in queries:

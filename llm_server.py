@@ -205,7 +205,7 @@ def list_tables():
     """Catalog: SchemaCatalogEntry::Scan(TABLE_ENTRY) — list table names."""
     print("[request] GET /tables", flush=True)
     t0 = time.time()
-    tables = generate_table_list(db.model, db.tokenizer)
+    tables = generate_table_list(db.model, db.tokenizer, log_file=db.llm_log)
     print(f"[request] GET /tables done in {time.time()-t0:.3f}s — {tables}", flush=True)
     return {"tables": tables}
 
@@ -215,7 +215,7 @@ def get_schema(table_name: str):
     """Catalog: SchemaCatalogEntry::LookupEntry — get column definitions."""
     print(f"[request] GET /schema/{table_name}", flush=True)
     t0 = time.time()
-    columns = generate_column_list(db.model, db.tokenizer, table_name)
+    columns = generate_column_list(db.model, db.tokenizer, table_name, log_file=db.llm_log)
     print(f"[request] GET /schema/{table_name} done in {time.time()-t0:.3f}s — {len(columns)} columns", flush=True)
     return {"table": table_name, "columns": columns}
 
@@ -226,13 +226,13 @@ def lookup_table(table_name: str):
     print(f"[request] GET /lookup/{table_name}", flush=True)
     t0 = time.time()
 
-    tables = generate_table_list(db.model, db.tokenizer)
+    tables = generate_table_list(db.model, db.tokenizer, log_file=db.llm_log)
     t_show = time.time()
     if table_name not in tables:
         print(f"[request] GET /lookup/{table_name}: not found ({time.time()-t0:.3f}s)", flush=True)
         return {"exists": False}
 
-    columns = generate_column_list(db.model, db.tokenizer, table_name)
+    columns = generate_column_list(db.model, db.tokenizer, table_name, log_file=db.llm_log)
     print(f"[request] GET /lookup/{table_name} done in {time.time()-t0:.3f}s "
           f"(tables={t_show-t0:.3f}s, schema={time.time()-t_show:.3f}s)", flush=True)
     return {"exists": True, "table": table_name, "columns": columns}
@@ -244,13 +244,13 @@ def tables_and_schemas():
     print("[request] GET /tables_and_schemas", flush=True)
     t0 = time.time()
 
-    tables = generate_table_list(db.model, db.tokenizer)
+    tables = generate_table_list(db.model, db.tokenizer, log_file=db.llm_log)
     print(f"[request]   tables: {tables} ({time.time()-t0:.3f}s)", flush=True)
 
     result = []
     for tbl_name in tables:
         t_desc = time.time()
-        columns = generate_column_list(db.model, db.tokenizer, tbl_name)
+        columns = generate_column_list(db.model, db.tokenizer, tbl_name, log_file=db.llm_log)
         print(f"[request]   {tbl_name}: {len(columns)} columns ({time.time()-t_desc:.3f}s)", flush=True)
         result.append({"table": tbl_name, "columns": columns})
 
@@ -271,11 +271,11 @@ def structured_query(req: QueryRequest):
     filters_for_model = [(f.column, f.op, f.value) for f in req.filters] if req.filters else None
 
     rows = generate_rows(db.model, db.tokenizer, req.table, col_names,
-                         filters=filters_for_model)
+                         filters=filters_for_model, log_file=db.llm_log)
 
     # If no specific columns requested, infer from schema
     if not col_names or col_names == ["*"]:
-        col_defs = generate_column_list(db.model, db.tokenizer, req.table)
+        col_defs = generate_column_list(db.model, db.tokenizer, req.table, log_file=db.llm_log)
         col_names = [c["name"] for c in col_defs]
         if rows and len(col_names) != len(rows[0]):
             col_names = [f"col_{i}" for i in range(len(rows[0]))]
