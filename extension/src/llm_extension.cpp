@@ -72,181 +72,18 @@ class LlmCatalog;
 class LlmSchemaEntry;
 class LlmTableEntry;
 
-class JsonWriteDocument {
-public:
-	JsonWriteDocument() : doc(yyjson_mut_doc_new(nullptr)) {
-		if (!doc) {
-			throw InternalException("Failed to allocate LLM adapter JSON document");
-		}
+static string WriteJsonAndFree(yyjson_mut_doc *doc) {
+	size_t len = 0;
+	yyjson_write_err error;
+	auto data = yyjson_mut_write_opts(doc, YYJSON_WRITE_NOFLAG, nullptr, &len, &error);
+	if (!data) {
+		yyjson_mut_doc_free(doc);
+		throw IOException("Failed to serialize LLM adapter JSON: %s", error.msg ? error.msg : "unknown error");
 	}
-	JsonWriteDocument(const JsonWriteDocument &) = delete;
-	JsonWriteDocument &operator=(const JsonWriteDocument &) = delete;
-	~JsonWriteDocument() {
-		if (doc) {
-			yyjson_mut_doc_free(doc);
-		}
-	}
-	yyjson_mut_doc *Doc() {
-		return doc;
-	}
-	yyjson_mut_val *Object() {
-		return yyjson_mut_obj(doc);
-	}
-	yyjson_mut_val *Array() {
-		return yyjson_mut_arr(doc);
-	}
-	yyjson_mut_val *String(const string &value) {
-		return yyjson_mut_strncpy(doc, value.c_str(), value.size());
-	}
-	yyjson_mut_val *String(const char *value) {
-		return yyjson_mut_strcpy(doc, value);
-	}
-	yyjson_mut_val *Bool(bool value) {
-		return yyjson_mut_bool(doc, value);
-	}
-	yyjson_mut_val *Int(int64_t value) {
-		return yyjson_mut_int(doc, value);
-	}
-	yyjson_mut_val *Double(double value) {
-		return yyjson_mut_real(doc, value);
-	}
-	yyjson_mut_val *Null() {
-		return yyjson_mut_null(doc);
-	}
-	string Write(yyjson_mut_val *root) {
-		yyjson_mut_doc_set_root(doc, root);
-		size_t len = 0;
-		yyjson_write_err error;
-		auto data = yyjson_mut_write_opts(doc, YYJSON_WRITE_NOFLAG, nullptr, &len, &error);
-		if (!data) {
-			throw IOException("Failed to serialize LLM adapter JSON: %s", error.msg ? error.msg : "unknown error");
-		}
-		string result(data, len);
-		std::free(data);
-		return result;
-	}
-	yyjson_mut_val *ParseAndCopy(const string &json, const string &context) {
-		string input = json;
-		yyjson_read_err error;
-		auto parsed = yyjson_read_opts(input.empty() ? nullptr : &input[0], input.size(), YYJSON_READ_NOFLAG, nullptr,
-		                               &error);
-		if (!parsed) {
-			throw InvalidInputException("Malformed LLM adapter JSON in %s at byte %llu: %s", context, error.pos,
-			                            error.msg ? error.msg : "unknown error");
-		}
-		auto root = yyjson_doc_get_root(parsed);
-		auto copied = yyjson_val_mut_copy(doc, root);
-		yyjson_doc_free(parsed);
-		if (!copied) {
-			throw InternalException("Failed to copy LLM adapter JSON value for %s", context);
-		}
-		return copied;
-	}
-
-private:
-	yyjson_mut_doc *doc;
-};
-
-class JsonReadDocument {
-public:
-	explicit JsonReadDocument(string input_p, string context_p) : input(std::move(input_p)), context(std::move(context_p)) {
-		yyjson_read_err error;
-		doc = yyjson_read_opts(input.empty() ? nullptr : &input[0], input.size(), YYJSON_READ_NOFLAG, nullptr, &error);
-		if (!doc) {
-			throw InvalidInputException("Malformed LLM adapter JSON in %s at byte %llu: %s", context, error.pos,
-			                            error.msg ? error.msg : "unknown error");
-		}
-	}
-	JsonReadDocument(const JsonReadDocument &) = delete;
-	JsonReadDocument &operator=(const JsonReadDocument &) = delete;
-	~JsonReadDocument() {
-		if (doc) {
-			yyjson_doc_free(doc);
-		}
-	}
-	yyjson_val *Root() const {
-		auto root = yyjson_doc_get_root(doc);
-		if (!root) {
-			throw InvalidInputException("Malformed LLM adapter JSON in %s: missing root value", context);
-		}
-		return root;
-	}
-
-private:
-	string input;
-	string context;
-	yyjson_doc *doc;
-};
-
-static void JsonAdd(JsonWriteDocument &doc, yyjson_mut_val *object, const char *key, yyjson_mut_val *value) {
-	if (!yyjson_mut_obj_add_val(doc.Doc(), object, key, value)) {
-		throw InternalException("Failed to add JSON field \"%s\"", key);
-	}
-}
-
-static void JsonAppend(yyjson_mut_val *array, yyjson_mut_val *value) {
-	if (!yyjson_mut_arr_add_val(array, value)) {
-		throw InternalException("Failed to append JSON array value");
-	}
-}
-
-static yyjson_val *JsonRequire(yyjson_val *object, const char *key, const string &context) {
-	if (!yyjson_is_obj(object)) {
-		throw InvalidInputException("Malformed LLM adapter JSON: expected object for %s", context);
-	}
-	auto value = yyjson_obj_get(object, key);
-	if (!value) {
-		throw InvalidInputException("Malformed LLM adapter JSON: missing field \"%s\" in %s", key, context);
-	}
-	return value;
-}
-
-static yyjson_val *JsonGet(yyjson_val *object, const char *key) {
-	if (!yyjson_is_obj(object)) {
-		return nullptr;
-	}
-	return yyjson_obj_get(object, key);
-}
-
-static yyjson_val *JsonArray(yyjson_val *value, const string &context) {
-	if (!yyjson_is_arr(value)) {
-		throw InvalidInputException("Malformed LLM adapter JSON: expected array for %s", context);
-	}
-	return value;
-}
-
-static string JsonString(yyjson_val *value, const string &context) {
-	if (!yyjson_is_str(value)) {
-		throw InvalidInputException("Malformed LLM adapter JSON: expected string for %s", context);
-	}
-	return string(yyjson_get_str(value), yyjson_get_len(value));
-}
-
-static bool JsonBoolean(yyjson_val *value, const string &context) {
-	if (yyjson_is_true(value)) {
-		return true;
-	}
-	if (yyjson_is_false(value)) {
-		return false;
-	}
-	throw InvalidInputException("Malformed LLM adapter JSON: expected boolean for %s", context);
-}
-
-static int64_t JsonInteger(yyjson_val *value, const string &context) {
-	if (!yyjson_is_int(value)) {
-		throw InvalidInputException("Malformed LLM adapter JSON: expected integer for %s", context);
-	}
-	return yyjson_get_sint(value);
-}
-
-static double JsonNumber(yyjson_val *value, const string &context) {
-	if (yyjson_is_int(value)) {
-		return static_cast<double>(yyjson_get_sint(value));
-	}
-	if (yyjson_is_real(value)) {
-		return yyjson_get_real(value);
-	}
-	throw InvalidInputException("Malformed LLM adapter JSON: expected number for %s", context);
+	string result(data, len);
+	std::free(data);
+	yyjson_mut_doc_free(doc);
+	return result;
 }
 
 struct LlmColumnMeta {
@@ -348,59 +185,88 @@ static LogicalType ParseAdapterType(ClientContext &context, const string &type_s
 	return type;
 }
 
-static yyjson_mut_val *ValueToJson(JsonWriteDocument &doc, const Value &value) {
+static yyjson_mut_val *DuckValueToYyjsonLiteral(yyjson_mut_doc *doc, const Value &value) {
 	if (value.IsNull()) {
-		return doc.Null();
+		return yyjson_mut_null(doc);
 	}
 	switch (value.type().id()) {
 	case LogicalTypeId::BOOLEAN:
-		return doc.Bool(value.GetValue<bool>());
+		return yyjson_mut_bool(doc, value.GetValue<bool>());
 	case LogicalTypeId::TINYINT:
-		return doc.Int(static_cast<int64_t>(value.GetValue<int8_t>()));
+		return yyjson_mut_int(doc, static_cast<int64_t>(value.GetValue<int8_t>()));
 	case LogicalTypeId::SMALLINT:
-		return doc.Int(static_cast<int64_t>(value.GetValue<int16_t>()));
+		return yyjson_mut_int(doc, static_cast<int64_t>(value.GetValue<int16_t>()));
 	case LogicalTypeId::INTEGER:
-		return doc.Int(static_cast<int64_t>(value.GetValue<int32_t>()));
+		return yyjson_mut_int(doc, static_cast<int64_t>(value.GetValue<int32_t>()));
 	case LogicalTypeId::BIGINT:
-		return doc.Int(value.GetValue<int64_t>());
+		return yyjson_mut_int(doc, value.GetValue<int64_t>());
 	case LogicalTypeId::FLOAT:
-		return doc.Double(static_cast<double>(value.GetValue<float>()));
+		return yyjson_mut_real(doc, static_cast<double>(value.GetValue<float>()));
 	case LogicalTypeId::DOUBLE:
-		return doc.Double(value.GetValue<double>());
-	case LogicalTypeId::VARCHAR:
-		return doc.String(value.GetValue<string>());
+		return yyjson_mut_real(doc, value.GetValue<double>());
+	case LogicalTypeId::VARCHAR: {
+		auto string_value = value.GetValue<string>();
+		return yyjson_mut_strncpy(doc, string_value.c_str(), string_value.size());
+	}
 	default:
 		throw NotImplementedException("LLM adapter cannot serialize literal of type \"%s\" yet", value.type().ToString());
 	}
 }
 
-static Value JsonToValue(yyjson_val *json, const LogicalType &type, const string &context) {
+static Value YyjsonLiteralToDuckValue(yyjson_val *json, const LogicalType &type, const string &context) {
 	if (yyjson_is_null(json)) {
 		return Value(type);
 	}
 	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return Value::BOOLEAN(JsonBoolean(json, context));
+	case LogicalTypeId::BOOLEAN: {
+		if (!yyjson_is_bool(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected boolean for %s", context);
+		}
+		return Value::BOOLEAN(yyjson_get_bool(json));
+	}
 	case LogicalTypeId::TINYINT:
-		return Value::TINYINT(NumericCast<int8_t>(JsonInteger(json, context)));
+		if (!yyjson_is_int(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected integer for %s", context);
+		}
+		return Value::TINYINT(NumericCast<int8_t>(yyjson_get_sint(json)));
 	case LogicalTypeId::SMALLINT:
-		return Value::SMALLINT(NumericCast<int16_t>(JsonInteger(json, context)));
+		if (!yyjson_is_int(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected integer for %s", context);
+		}
+		return Value::SMALLINT(NumericCast<int16_t>(yyjson_get_sint(json)));
 	case LogicalTypeId::INTEGER:
-		return Value::INTEGER(NumericCast<int32_t>(JsonInteger(json, context)));
+		if (!yyjson_is_int(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected integer for %s", context);
+		}
+		return Value::INTEGER(NumericCast<int32_t>(yyjson_get_sint(json)));
 	case LogicalTypeId::BIGINT:
-		return Value::BIGINT(JsonInteger(json, context));
-	case LogicalTypeId::FLOAT:
-		return Value(static_cast<float>(JsonNumber(json, context)));
+		if (!yyjson_is_int(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected integer for %s", context);
+		}
+		return Value::BIGINT(yyjson_get_sint(json));
+	case LogicalTypeId::FLOAT: {
+		if (!yyjson_is_int(json) && !yyjson_is_real(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected number for %s", context);
+		}
+		auto number = yyjson_is_int(json) ? static_cast<double>(yyjson_get_sint(json)) : yyjson_get_real(json);
+		return Value(static_cast<float>(number));
+	}
 	case LogicalTypeId::DOUBLE:
-		return Value::DOUBLE(JsonNumber(json, context));
+		if (!yyjson_is_int(json) && !yyjson_is_real(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected number for %s", context);
+		}
+		return Value::DOUBLE(yyjson_is_int(json) ? static_cast<double>(yyjson_get_sint(json)) : yyjson_get_real(json));
 	case LogicalTypeId::VARCHAR:
-		return Value(JsonString(json, context));
+		if (!yyjson_is_str(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected string for %s", context);
+		}
+		return Value(string(yyjson_get_str(json), yyjson_get_len(json)));
 	default:
 		throw NotImplementedException("LLM adapter cannot materialize values of type \"%s\" yet", type.ToString());
 	}
 }
 
-static yyjson_mut_val *ColumnReferenceToJson(JsonWriteDocument &doc, const LogicalGet &get,
+static yyjson_mut_val *ColumnReferenceToJson(yyjson_mut_doc *doc, const LogicalGet &get,
                                              const BoundColumnRefExpression &column) {
 	auto binding_index = column.binding.column_index;
 	auto &column_ids = get.GetColumnIds();
@@ -411,18 +277,21 @@ static yyjson_mut_val *ColumnReferenceToJson(JsonWriteDocument &doc, const Logic
 	if (column_index >= get.names.size()) {
 		throw NotImplementedException("LLM adapter cannot push down virtual column reference");
 	}
-	auto result = doc.Object();
-	JsonAdd(doc, result, "kind", doc.String("column"));
-	JsonAdd(doc, result, "name", doc.String(get.names[column_index]));
-	JsonAdd(doc, result, "duckdb_type", doc.String(get.returned_types[column_index].ToString()));
+	auto result = yyjson_mut_obj(doc);
+	auto &name = get.names[column_index];
+	auto type_string = get.returned_types[column_index].ToString();
+	yyjson_mut_obj_add_str(doc, result, "kind", "column");
+	yyjson_mut_obj_add_strncpy(doc, result, "name", name.c_str(), name.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "duckdb_type", type_string.c_str(), type_string.size());
 	return result;
 }
 
-static yyjson_mut_val *LiteralToJson(JsonWriteDocument &doc, const BoundConstantExpression &constant) {
-	auto result = doc.Object();
-	JsonAdd(doc, result, "kind", doc.String("literal"));
-	JsonAdd(doc, result, "value", ValueToJson(doc, constant.value));
-	JsonAdd(doc, result, "duckdb_type", doc.String(constant.value.type().ToString()));
+static yyjson_mut_val *LiteralToJson(yyjson_mut_doc *doc, const BoundConstantExpression &constant) {
+	auto result = yyjson_mut_obj(doc);
+	auto type_string = constant.value.type().ToString();
+	yyjson_mut_obj_add_str(doc, result, "kind", "literal");
+	yyjson_mut_obj_add_val(doc, result, "value", DuckValueToYyjsonLiteral(doc, constant.value));
+	yyjson_mut_obj_add_strncpy(doc, result, "duckdb_type", type_string.c_str(), type_string.size());
 	return result;
 }
 
@@ -444,9 +313,9 @@ static bool IsSupportedArithmeticFunction(const string &name) {
 	return name == "+" || name == "-" || name == "*" || name == "/" || name == "//" || name == "%";
 }
 
-static yyjson_mut_val *ExpressionToPredicate(JsonWriteDocument &doc, const LogicalGet &get, const Expression &expr);
+static yyjson_mut_val *ExpressionToPredicate(yyjson_mut_doc *doc, const LogicalGet &get, const Expression &expr);
 
-static yyjson_mut_val *ArithmeticFunctionToJson(JsonWriteDocument &doc, const LogicalGet &get,
+static yyjson_mut_val *ArithmeticFunctionToJson(yyjson_mut_doc *doc, const LogicalGet &get,
                                                 const BoundFunctionExpression &function) {
 	if (!IsSupportedArithmeticFunction(function.function.name)) {
 		throw NotImplementedException("LLM adapter cannot push down scalar function \"%s\" yet", function.function.name);
@@ -459,19 +328,20 @@ static yyjson_mut_val *ArithmeticFunctionToJson(JsonWriteDocument &doc, const Lo
 		throw NotImplementedException("LLM adapter cannot push down arithmetic result type \"%s\" yet",
 		                              function.return_type.ToString());
 	}
-	auto args = doc.Array();
+	auto args = yyjson_mut_arr(doc);
 	for (auto &child : function.children) {
-		JsonAppend(args, ExpressionToPredicate(doc, get, *child));
+		yyjson_mut_arr_add_val(args, ExpressionToPredicate(doc, get, *child));
 	}
-	auto result = doc.Object();
-	JsonAdd(doc, result, "kind", doc.String("arithmetic"));
-	JsonAdd(doc, result, "op", doc.String(function.function.name));
-	JsonAdd(doc, result, "duckdb_type", doc.String(function.return_type.ToString()));
-	JsonAdd(doc, result, "args", args);
+	auto result = yyjson_mut_obj(doc);
+	auto return_type = function.return_type.ToString();
+	yyjson_mut_obj_add_str(doc, result, "kind", "arithmetic");
+	yyjson_mut_obj_add_strncpy(doc, result, "op", function.function.name.c_str(), function.function.name.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "duckdb_type", return_type.c_str(), return_type.size());
+	yyjson_mut_obj_add_val(doc, result, "args", args);
 	return result;
 }
 
-static yyjson_mut_val *ExpressionToPredicate(JsonWriteDocument &doc, const LogicalGet &get, const Expression &expr) {
+static yyjson_mut_val *ExpressionToPredicate(yyjson_mut_doc *doc, const LogicalGet &get, const Expression &expr) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF:
 		return ColumnReferenceToJson(doc, get, expr.Cast<BoundColumnRefExpression>());
@@ -486,22 +356,24 @@ static yyjson_mut_val *ExpressionToPredicate(JsonWriteDocument &doc, const Logic
 	}
 	case ExpressionClass::BOUND_COMPARISON: {
 		auto &comparison = expr.Cast<BoundComparisonExpression>();
-		auto result = doc.Object();
-		JsonAdd(doc, result, "kind", doc.String("comparison"));
-		JsonAdd(doc, result, "op", doc.String(ComparisonOperatorToString(expr.GetExpressionType())));
-		JsonAdd(doc, result, "left", ExpressionToPredicate(doc, get, *comparison.left));
-		JsonAdd(doc, result, "right", ExpressionToPredicate(doc, get, *comparison.right));
+		auto result = yyjson_mut_obj(doc);
+		auto op = ComparisonOperatorToString(expr.GetExpressionType());
+		yyjson_mut_obj_add_str(doc, result, "kind", "comparison");
+		yyjson_mut_obj_add_strncpy(doc, result, "op", op.c_str(), op.size());
+		yyjson_mut_obj_add_val(doc, result, "left", ExpressionToPredicate(doc, get, *comparison.left));
+		yyjson_mut_obj_add_val(doc, result, "right", ExpressionToPredicate(doc, get, *comparison.right));
 		return result;
 	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
-		auto children = doc.Array();
+		auto children = yyjson_mut_arr(doc);
 		for (auto &child : conjunction.children) {
-			JsonAppend(children, ExpressionToPredicate(doc, get, *child));
+			yyjson_mut_arr_add_val(children, ExpressionToPredicate(doc, get, *child));
 		}
-		auto result = doc.Object();
-		JsonAdd(doc, result, "kind", doc.String(expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or"));
-		JsonAdd(doc, result, "children", children);
+		auto result = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_str(doc, result, "kind",
+		                       expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or");
+		yyjson_mut_obj_add_val(doc, result, "children", children);
 		return result;
 	}
 	case ExpressionClass::BOUND_FUNCTION:
@@ -513,10 +385,10 @@ static yyjson_mut_val *ExpressionToPredicate(JsonWriteDocument &doc, const Logic
 			if (op.children.size() != 1) {
 				throw InternalException("Unexpected IS NULL child count");
 			}
-			auto result = doc.Object();
-			JsonAdd(doc, result, "kind",
-			        doc.String(expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ? "is_null" : "is_not_null"));
-			JsonAdd(doc, result, "expr", ExpressionToPredicate(doc, get, *op.children[0]));
+			auto result = yyjson_mut_obj(doc);
+			yyjson_mut_obj_add_str(doc, result, "kind",
+			                       expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ? "is_null" : "is_not_null");
+			yyjson_mut_obj_add_val(doc, result, "expr", ExpressionToPredicate(doc, get, *op.children[0]));
 			return result;
 		}
 		throw NotImplementedException("LLM adapter cannot push down operator \"%s\" yet",
@@ -536,8 +408,8 @@ public:
 	const string &CheckpointRef() const {
 		return checkpoint_ref;
 	}
-	unique_ptr<JsonReadDocument> Post(ClientContext &, const string &path, const string &body) const {
-		return make_uniq<JsonReadDocument>(HttpPostJson(parsed_endpoint, path, body), path);
+	string Post(ClientContext &, const string &path, const string &body) const {
+		return HttpPostJson(parsed_endpoint, path, body);
 	}
 
 private:
@@ -795,26 +667,48 @@ public:
 		return catalog_version;
 	}
 	LlmCatalogSnapshot Introspect(ClientContext &context) {
-		JsonWriteDocument doc;
-		auto request = doc.Object();
-		JsonAdd(doc, request, "type", doc.String("introspect_catalog"));
-		JsonAdd(doc, request, "catalog", doc.String(GetName()));
-		JsonAdd(doc, request, "checkpoint_ref", doc.String(client.CheckpointRef()));
-		auto response = client.Post(context, "/v1/catalog/introspect", doc.Write(request));
-		return ParseCatalogSnapshot(context, response->Root());
+		auto doc = yyjson_mut_doc_new(nullptr);
+		if (!doc) {
+			throw InternalException("Failed to allocate LLM adapter JSON document");
+		}
+		auto request = yyjson_mut_obj(doc);
+		yyjson_mut_doc_set_root(doc, request);
+		auto catalog_name = GetName();
+		yyjson_mut_obj_add_str(doc, request, "type", "introspect_catalog");
+		yyjson_mut_obj_add_strncpy(doc, request, "catalog", catalog_name.c_str(), catalog_name.size());
+		yyjson_mut_obj_add_strncpy(doc, request, "checkpoint_ref", client.CheckpointRef().c_str(),
+		                           client.CheckpointRef().size());
+		auto response = client.Post(context, "/v1/catalog/introspect", WriteJsonAndFree(doc));
+		yyjson_read_err error;
+		auto response_doc = yyjson_read_opts(response.empty() ? nullptr : &response[0], response.size(), YYJSON_READ_NOFLAG,
+		                                     nullptr, &error);
+		if (!response_doc) {
+			throw InvalidInputException("Malformed LLM adapter JSON in catalog introspection at byte %llu: %s", error.pos,
+			                            error.msg ? error.msg : "unknown error");
+		}
+		unique_ptr<yyjson_doc, void (*)(yyjson_doc *)> response_guard(response_doc, yyjson_doc_free);
+		auto root = yyjson_doc_get_root(response_doc);
+		if (!root) {
+			throw InvalidInputException("Malformed LLM adapter JSON in catalog introspection: missing root value");
+		}
+		return ParseCatalogSnapshot(context, root);
 	}
 	void ReplaceCatalog(ClientContext &context, const LlmCatalogSnapshot &snapshot) {
 		catalog_version = snapshot.version;
 		main_schema->ReplaceTables(context, snapshot.tables);
 	}
 	optional_ptr<CatalogEntry> ApplyCreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info);
-	unique_ptr<JsonReadDocument> Select(ClientContext &context, const string &query_json) {
-		JsonWriteDocument doc;
-		auto request = doc.Object();
-		JsonAdd(doc, request, "type", doc.String("select"));
-		JsonAdd(doc, request, "catalog_version", doc.String(catalog_version));
-		JsonAdd(doc, request, "query", doc.ParseAndCopy(query_json, "select query"));
-		return client.Post(context, "/v1/query/select", doc.Write(request));
+	string Select(ClientContext &context, const string &query_json) {
+		auto doc = yyjson_mut_doc_new(nullptr);
+		if (!doc) {
+			throw InternalException("Failed to allocate LLM adapter JSON document");
+		}
+		auto request = yyjson_mut_obj(doc);
+		yyjson_mut_doc_set_root(doc, request);
+		yyjson_mut_obj_add_str(doc, request, "type", "select");
+		yyjson_mut_obj_add_strncpy(doc, request, "catalog_version", catalog_version.c_str(), catalog_version.size());
+		yyjson_mut_obj_add_val(doc, request, "query", yyjson_mut_rawncpy(doc, query_json.c_str(), query_json.size()));
+		return client.Post(context, "/v1/query/select", WriteJsonAndFree(doc));
 	}
 
 private:
@@ -823,40 +717,90 @@ private:
 	}
 	LlmCatalogSnapshot ParseCatalogSnapshot(ClientContext &context, yyjson_val *json) {
 		LlmCatalogSnapshot snapshot;
-		snapshot.version = JsonString(JsonRequire(json, "catalog_version", "catalog snapshot"), "catalog_version");
-		auto schemas = JsonArray(JsonRequire(json, "schemas", "catalog snapshot"), "catalog snapshot schemas");
+		if (!yyjson_is_obj(json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected object for catalog snapshot");
+		}
+		auto version = yyjson_obj_get(json, "catalog_version");
+		if (!yyjson_is_str(version)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected string for catalog_version");
+		}
+		snapshot.version = string(yyjson_get_str(version), yyjson_get_len(version));
+		auto schemas = yyjson_obj_get(json, "schemas");
+		if (!yyjson_is_arr(schemas)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected array for catalog snapshot schemas");
+		}
 		size_t schema_idx, schema_max;
 		yyjson_val *schema_json;
 		yyjson_arr_foreach(schemas, schema_idx, schema_max, schema_json) {
-			auto schema_name = JsonString(JsonRequire(schema_json, "name", "schema"), "schema.name");
+			if (!yyjson_is_obj(schema_json)) {
+				throw InvalidInputException("Malformed LLM adapter JSON: expected object for schema");
+			}
+			auto schema_name_json = yyjson_obj_get(schema_json, "name");
+			if (!yyjson_is_str(schema_name_json)) {
+				throw InvalidInputException("Malformed LLM adapter JSON: expected string for schema.name");
+			}
+			auto schema_name = string(yyjson_get_str(schema_name_json), yyjson_get_len(schema_name_json));
 			if (schema_name != DEFAULT_SCHEMA) {
 				throw NotImplementedException("LLM adapter only supports the \"%s\" schema for now",
 				                              string(DEFAULT_SCHEMA));
 			}
-			auto tables = JsonArray(JsonRequire(schema_json, "tables", "schema"), "schema.tables");
+			auto tables = yyjson_obj_get(schema_json, "tables");
+			if (!yyjson_is_arr(tables)) {
+				throw InvalidInputException("Malformed LLM adapter JSON: expected array for schema.tables");
+			}
 			size_t table_idx, table_max;
 			yyjson_val *table_json;
 			yyjson_arr_foreach(tables, table_idx, table_max, table_json) {
+				if (!yyjson_is_obj(table_json)) {
+					throw InvalidInputException("Malformed LLM adapter JSON: expected object for table");
+				}
 				LlmTableMeta table;
 				table.schema = schema_name;
-				table.name = JsonString(JsonRequire(table_json, "name", "table"), "table.name");
-				auto columns = JsonArray(JsonRequire(table_json, "columns", "table"), "table.columns");
+				auto table_name = yyjson_obj_get(table_json, "name");
+				if (!yyjson_is_str(table_name)) {
+					throw InvalidInputException("Malformed LLM adapter JSON: expected string for table.name");
+				}
+				table.name = string(yyjson_get_str(table_name), yyjson_get_len(table_name));
+				auto columns = yyjson_obj_get(table_json, "columns");
+				if (!yyjson_is_arr(columns)) {
+					throw InvalidInputException("Malformed LLM adapter JSON: expected array for table.columns");
+				}
 				size_t column_idx, column_max;
 				yyjson_val *column_json;
 				yyjson_arr_foreach(columns, column_idx, column_max, column_json) {
+					if (!yyjson_is_obj(column_json)) {
+						throw InvalidInputException("Malformed LLM adapter JSON: expected object for column");
+					}
 					LlmColumnMeta column;
-					column.name = JsonString(JsonRequire(column_json, "name", "column"), "column.name");
-					auto type_string = JsonString(JsonRequire(column_json, "duckdb_type", "column"), "column.duckdb_type");
+					auto column_name = yyjson_obj_get(column_json, "name");
+					if (!yyjson_is_str(column_name)) {
+						throw InvalidInputException("Malformed LLM adapter JSON: expected string for column.name");
+					}
+					column.name = string(yyjson_get_str(column_name), yyjson_get_len(column_name));
+					auto duckdb_type = yyjson_obj_get(column_json, "duckdb_type");
+					if (!yyjson_is_str(duckdb_type)) {
+						throw InvalidInputException("Malformed LLM adapter JSON: expected string for column.duckdb_type");
+					}
+					auto type_string = string(yyjson_get_str(duckdb_type), yyjson_get_len(duckdb_type));
 					column.type = ParseAdapterType(context, type_string);
-					column.nullable = JsonBoolean(JsonRequire(column_json, "nullable", "column"), "column.nullable");
+					auto nullable = yyjson_obj_get(column_json, "nullable");
+					if (!yyjson_is_bool(nullable)) {
+						throw InvalidInputException("Malformed LLM adapter JSON: expected boolean for column.nullable");
+					}
+					column.nullable = yyjson_get_bool(nullable);
 					table.columns.push_back(std::move(column));
 				}
-				if (auto primary_key = JsonGet(table_json, "primary_key")) {
-					auto primary_key_array = JsonArray(primary_key, "table.primary_key");
+				if (auto primary_key = yyjson_obj_get(table_json, "primary_key")) {
+					if (!yyjson_is_arr(primary_key)) {
+						throw InvalidInputException("Malformed LLM adapter JSON: expected array for table.primary_key");
+					}
 					size_t key_idx, key_max;
 					yyjson_val *key_json;
-					yyjson_arr_foreach(primary_key_array, key_idx, key_max, key_json) {
-						table.primary_key.push_back(JsonString(key_json, "primary_key column"));
+					yyjson_arr_foreach(primary_key, key_idx, key_max, key_json) {
+						if (!yyjson_is_str(key_json)) {
+							throw InvalidInputException("Malformed LLM adapter JSON: expected string for primary_key column");
+						}
+						table.primary_key.push_back(string(yyjson_get_str(key_json), yyjson_get_len(key_json)));
 					}
 				}
 				snapshot.tables.push_back(std::move(table));
@@ -989,37 +933,39 @@ static void ValidateCreateTable(const CreateTableInfo &base) {
 	}
 }
 
-static yyjson_mut_val *CreateTableOpToJson(JsonWriteDocument &doc, const string &catalog_name,
+static yyjson_mut_val *CreateTableOpToJson(yyjson_mut_doc *doc, const string &catalog_name,
                                            BoundCreateTableInfo &info) {
 	auto &base = info.Base();
 	ValidateCreateTable(base);
-	auto columns = doc.Array();
+	auto columns = yyjson_mut_arr(doc);
 	idx_t column_idx = 0;
 	for (auto &column : base.columns.Logical()) {
-		auto column_json = doc.Object();
-		JsonAdd(doc, column_json, "name", doc.String(column.Name()));
-		JsonAdd(doc, column_json, "duckdb_type", doc.String(column.Type().ToString()));
-		JsonAdd(doc, column_json, "nullable", doc.Bool(ColumnIsNullable(base, column_idx)));
-		JsonAdd(doc, column_json, "default", doc.Null());
-		JsonAdd(doc, column_json, "generated", doc.Bool(false));
-		JsonAppend(columns, column_json);
+		auto column_json = yyjson_mut_obj(doc);
+		auto column_name = column.Name();
+		auto column_type = column.Type().ToString();
+		yyjson_mut_obj_add_strncpy(doc, column_json, "name", column_name.c_str(), column_name.size());
+		yyjson_mut_obj_add_strncpy(doc, column_json, "duckdb_type", column_type.c_str(), column_type.size());
+		yyjson_mut_obj_add_bool(doc, column_json, "nullable", ColumnIsNullable(base, column_idx));
+		yyjson_mut_obj_add_null(doc, column_json, "default");
+		yyjson_mut_obj_add_bool(doc, column_json, "generated", false);
+		yyjson_mut_arr_add_val(columns, column_json);
 		column_idx++;
 	}
-	auto primary_key = doc.Array();
+	auto primary_key = yyjson_mut_arr(doc);
 	for (auto &column : ExtractPrimaryKey(base)) {
-		JsonAppend(primary_key, doc.String(column));
+		yyjson_mut_arr_add_val(primary_key, yyjson_mut_strncpy(doc, column.c_str(), column.size()));
 	}
-	auto result = doc.Object();
-	JsonAdd(doc, result, "op", doc.String("create_table"));
-	JsonAdd(doc, result, "catalog", doc.String(catalog_name));
-	JsonAdd(doc, result, "schema", doc.String(base.schema));
-	JsonAdd(doc, result, "table", doc.String(base.table));
-	JsonAdd(doc, result, "on_conflict", doc.String("error"));
-	JsonAdd(doc, result, "columns", columns);
-	JsonAdd(doc, result, "primary_key", primary_key);
-	JsonAdd(doc, result, "unique", doc.Array());
-	JsonAdd(doc, result, "checks", doc.Array());
-	JsonAdd(doc, result, "foreign_keys", doc.Array());
+	auto result = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_str(doc, result, "op", "create_table");
+	yyjson_mut_obj_add_strncpy(doc, result, "catalog", catalog_name.c_str(), catalog_name.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "schema", base.schema.c_str(), base.schema.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "table", base.table.c_str(), base.table.size());
+	yyjson_mut_obj_add_str(doc, result, "on_conflict", "error");
+	yyjson_mut_obj_add_val(doc, result, "columns", columns);
+	yyjson_mut_obj_add_val(doc, result, "primary_key", primary_key);
+	yyjson_mut_obj_add_val(doc, result, "unique", yyjson_mut_arr(doc));
+	yyjson_mut_obj_add_val(doc, result, "checks", yyjson_mut_arr(doc));
+	yyjson_mut_obj_add_val(doc, result, "foreign_keys", yyjson_mut_arr(doc));
 	return result;
 }
 
@@ -1028,21 +974,44 @@ optional_ptr<CatalogEntry> LlmCatalog::ApplyCreateTable(CatalogTransaction trans
 		throw InternalException("LLM CREATE TABLE requires a client context");
 	}
 	auto &context = transaction.GetContext();
-	JsonWriteDocument doc;
+	auto doc = yyjson_mut_doc_new(nullptr);
+	if (!doc) {
+		throw InternalException("Failed to allocate LLM adapter JSON document");
+	}
 	auto op = CreateTableOpToJson(doc, GetName(), info);
-	auto operations = doc.Array();
-	JsonAppend(operations, op);
-	auto request = doc.Object();
-	JsonAdd(doc, request, "type", doc.String("apply_mutation"));
-	JsonAdd(doc, request, "base_catalog_version", doc.String(catalog_version));
-	JsonAdd(doc, request, "operations", operations);
-	auto response = client.Post(context, "/v1/mutations/apply", doc.Write(request));
-	auto root = response->Root();
-	auto status = JsonString(JsonRequire(root, "status", "mutation response"), "mutation status");
+	auto operations = yyjson_mut_arr(doc);
+	yyjson_mut_arr_add_val(operations, op);
+	auto request = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, request);
+	yyjson_mut_obj_add_str(doc, request, "type", "apply_mutation");
+	yyjson_mut_obj_add_strncpy(doc, request, "base_catalog_version", catalog_version.c_str(), catalog_version.size());
+	yyjson_mut_obj_add_val(doc, request, "operations", operations);
+	auto response = client.Post(context, "/v1/mutations/apply", WriteJsonAndFree(doc));
+	yyjson_read_err error;
+	auto response_doc = yyjson_read_opts(response.empty() ? nullptr : &response[0], response.size(), YYJSON_READ_NOFLAG,
+	                                     nullptr, &error);
+	if (!response_doc) {
+		throw InvalidInputException("Malformed LLM adapter JSON in mutation response at byte %llu: %s", error.pos,
+		                            error.msg ? error.msg : "unknown error");
+	}
+	unique_ptr<yyjson_doc, void (*)(yyjson_doc *)> response_guard(response_doc, yyjson_doc_free);
+	auto root = yyjson_doc_get_root(response_doc);
+	if (!yyjson_is_obj(root)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected object for mutation response");
+	}
+	auto status_json = yyjson_obj_get(root, "status");
+	if (!yyjson_is_str(status_json)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected string for mutation status");
+	}
+	auto status = string(yyjson_get_str(status_json), yyjson_get_len(status_json));
 	if (status != "applied") {
 		throw IOException("LLM mutation failed with status \"%s\"", status);
 	}
-	auto snapshot = ParseCatalogSnapshot(context, JsonRequire(root, "catalog", "mutation response"));
+	auto catalog = yyjson_obj_get(root, "catalog");
+	if (!catalog) {
+		throw InvalidInputException("Malformed LLM adapter JSON: missing catalog in mutation response");
+	}
+	auto snapshot = ParseCatalogSnapshot(context, catalog);
 	ReplaceCatalog(context, snapshot);
 	return main_schema->LookupEntry(transaction, EntryLookupInfo(CatalogType::TABLE_ENTRY, info.Base().table));
 }
@@ -1069,7 +1038,7 @@ static vector<idx_t> BuildOutputColumnIds(const vector<ColumnIndex> &column_ids,
 	return result;
 }
 
-static yyjson_mut_val *BuildProjectionJson(JsonWriteDocument &doc, const LlmTableEntry &table,
+static yyjson_mut_val *BuildProjectionJson(yyjson_mut_doc *doc, const LlmTableEntry &table,
                                            const vector<idx_t> &output_column_ids,
                                            vector<LogicalType> &response_types, vector<LogicalType> &output_types,
                                            vector<idx_t> &output_to_response) {
@@ -1086,14 +1055,15 @@ static yyjson_mut_val *BuildProjectionJson(JsonWriteDocument &doc, const LlmTabl
 	}
 	std::sort(response_column_ids.begin(), response_column_ids.end());
 
-	auto projections = doc.Array();
+	auto projections = yyjson_mut_arr(doc);
 	for (auto column_id : response_column_ids) {
 		auto &column = meta.columns[column_id];
 		response_types.push_back(column.type);
-		auto projection = doc.Object();
-		JsonAdd(doc, projection, "name", doc.String(column.name));
-		JsonAdd(doc, projection, "duckdb_type", doc.String(column.type.ToString()));
-		JsonAppend(projections, projection);
+		auto projection = yyjson_mut_obj(doc);
+		auto type_string = column.type.ToString();
+		yyjson_mut_obj_add_strncpy(doc, projection, "name", column.name.c_str(), column.name.size());
+		yyjson_mut_obj_add_strncpy(doc, projection, "duckdb_type", type_string.c_str(), type_string.size());
+		yyjson_mut_arr_add_val(projections, projection);
 	}
 	for (auto column_id : output_column_ids) {
 		auto entry = std::find(response_column_ids.begin(), response_column_ids.end(), column_id);
@@ -1113,19 +1083,45 @@ static unique_ptr<GlobalTableFunctionState> LlmScanInitGlobal(ClientContext &con
 	}
 	auto result = make_uniq<LlmScanGlobalState>();
 	auto output_column_ids = BuildOutputColumnIds(input.column_indexes, input.projection_ids);
-	JsonWriteDocument doc;
+	auto doc = yyjson_mut_doc_new(nullptr);
+	if (!doc) {
+		throw InternalException("Failed to allocate LLM adapter JSON document");
+	}
 	auto projection = BuildProjectionJson(doc, bind.table, output_column_ids, result->response_types, result->output_types,
 	                                      result->output_to_response);
-	auto query = doc.Object();
-	JsonAdd(doc, query, "schema", doc.String(bind.table.GetMeta().schema));
-	JsonAdd(doc, query, "table", doc.String(bind.table.GetMeta().name));
-	JsonAdd(doc, query, "projection", projection);
-	JsonAdd(doc, query, "predicate", bind.has_predicate ? doc.ParseAndCopy(bind.predicate_json, "select predicate")
-	                                                    : doc.Null());
-	JsonAdd(doc, query, "limit", bind.has_limit ? doc.Int(NumericCast<int64_t>(bind.limit)) : doc.Null());
-	auto response = bind.catalog.Select(context, doc.Write(query));
-	auto root = response->Root();
-	auto columns = JsonArray(JsonRequire(root, "columns", "select response"), "select columns");
+	auto query = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, query);
+	yyjson_mut_obj_add_strncpy(doc, query, "schema", bind.table.GetMeta().schema.c_str(),
+	                           bind.table.GetMeta().schema.size());
+	yyjson_mut_obj_add_strncpy(doc, query, "table", bind.table.GetMeta().name.c_str(),
+	                           bind.table.GetMeta().name.size());
+	yyjson_mut_obj_add_val(doc, query, "projection", projection);
+	yyjson_mut_obj_add_val(doc, query, "predicate",
+	                       bind.has_predicate ? yyjson_mut_rawncpy(doc, bind.predicate_json.c_str(),
+	                                                               bind.predicate_json.size())
+	                                          : yyjson_mut_null(doc));
+	if (bind.has_limit) {
+		yyjson_mut_obj_add_int(doc, query, "limit", NumericCast<int64_t>(bind.limit));
+	} else {
+		yyjson_mut_obj_add_null(doc, query, "limit");
+	}
+	auto response = bind.catalog.Select(context, WriteJsonAndFree(doc));
+	yyjson_read_err error;
+	auto response_doc = yyjson_read_opts(response.empty() ? nullptr : &response[0], response.size(), YYJSON_READ_NOFLAG,
+	                                     nullptr, &error);
+	if (!response_doc) {
+		throw InvalidInputException("Malformed LLM adapter JSON in select response at byte %llu: %s", error.pos,
+		                            error.msg ? error.msg : "unknown error");
+	}
+	unique_ptr<yyjson_doc, void (*)(yyjson_doc *)> response_guard(response_doc, yyjson_doc_free);
+	auto root = yyjson_doc_get_root(response_doc);
+	if (!yyjson_is_obj(root)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected object for select response");
+	}
+	auto columns = yyjson_obj_get(root, "columns");
+	if (!yyjson_is_arr(columns)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected array for select columns");
+	}
 	if (yyjson_arr_size(columns) != result->response_types.size()) {
 		throw IOException("LLM adapter select returned %llu columns, expected %llu",
 		                  NumericCast<idx_t>(yyjson_arr_size(columns)),
@@ -1134,25 +1130,37 @@ static unique_ptr<GlobalTableFunctionState> LlmScanInitGlobal(ClientContext &con
 	size_t column_idx, column_max;
 	yyjson_val *column_json;
 	yyjson_arr_foreach(columns, column_idx, column_max, column_json) {
-		auto returned_type = JsonString(JsonRequire(column_json, "duckdb_type", "select column"), "select column type");
+		if (!yyjson_is_obj(column_json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected object for select column");
+		}
+		auto duckdb_type = yyjson_obj_get(column_json, "duckdb_type");
+		if (!yyjson_is_str(duckdb_type)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected string for select column type");
+		}
+		auto returned_type = string(yyjson_get_str(duckdb_type), yyjson_get_len(duckdb_type));
 		if (returned_type != result->response_types[column_idx].ToString()) {
 			throw IOException("LLM adapter select returned type \"%s\" for column %llu, expected \"%s\"", returned_type,
 			                  column_idx, result->response_types[column_idx].ToString());
 		}
 	}
-	auto rows = JsonArray(JsonRequire(root, "rows", "select response"), "select rows");
+	auto rows = yyjson_obj_get(root, "rows");
+	if (!yyjson_is_arr(rows)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected array for select rows");
+	}
 	size_t row_idx, row_max;
 	yyjson_val *row_json;
 	yyjson_arr_foreach(rows, row_idx, row_max, row_json) {
-		auto row_array = JsonArray(row_json, "select row");
-		if (yyjson_arr_size(row_array) != result->response_types.size()) {
+		if (!yyjson_is_arr(row_json)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected array for select row");
+		}
+		if (yyjson_arr_size(row_json) != result->response_types.size()) {
 			throw IOException("LLM adapter select returned a row with the wrong width");
 		}
 		vector<Value> row_values;
 		size_t value_idx, value_max;
 		yyjson_val *value_json;
-		yyjson_arr_foreach(row_array, value_idx, value_max, value_json) {
-			row_values.push_back(JsonToValue(value_json, result->response_types[value_idx], "select row value"));
+		yyjson_arr_foreach(row_json, value_idx, value_max, value_json) {
+			row_values.push_back(YyjsonLiteralToDuckValue(value_json, result->response_types[value_idx], "select row value"));
 		}
 		result->rows.push_back(std::move(row_values));
 	}
@@ -1182,21 +1190,25 @@ static void LlmPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionD
 		return;
 	}
 	auto &bind = bind_data->Cast<LlmScanBindData>();
-	JsonWriteDocument doc;
-	auto predicates = doc.Array();
+	auto doc = yyjson_mut_doc_new(nullptr);
+	if (!doc) {
+		throw InternalException("Failed to allocate LLM adapter JSON document");
+	}
+	auto predicates = yyjson_mut_arr(doc);
 	for (auto &filter : filters) {
-		JsonAppend(predicates, ExpressionToPredicate(doc, get, *filter));
+		yyjson_mut_arr_add_val(predicates, ExpressionToPredicate(doc, get, *filter));
 	}
 	bind.has_predicate = true;
 	yyjson_mut_val *predicate = nullptr;
 	if (yyjson_mut_arr_size(predicates) == 1) {
 		predicate = yyjson_mut_arr_get(predicates, 0);
 	} else {
-		predicate = doc.Object();
-		JsonAdd(doc, predicate, "kind", doc.String("and"));
-		JsonAdd(doc, predicate, "children", predicates);
+		predicate = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_str(doc, predicate, "kind", "and");
+		yyjson_mut_obj_add_val(doc, predicate, "children", predicates);
 	}
-	bind.predicate_json = doc.Write(predicate);
+	yyjson_mut_doc_set_root(doc, predicate);
+	bind.predicate_json = WriteJsonAndFree(doc);
 	filters.clear();
 }
 
