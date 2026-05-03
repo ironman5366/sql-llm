@@ -84,6 +84,7 @@ for dir in \
 	mbedtls/include \
 	jaro_winkler \
 	vergesort \
+	httplib \
 	yyjson/include \
 	zstd/include
 do
