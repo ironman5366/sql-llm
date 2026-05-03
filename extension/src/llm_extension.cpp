@@ -573,7 +573,7 @@ public:
 		}
 		auto phase = ReadJsonString(event, "phase");
 		auto message = ReadJsonString(event, "message");
-		Render(NumericCast<int32_t>(percent + 0.5), phase, message);
+		Render(static_cast<int32_t>(percent + 0.5), phase, message);
 	}
 	void Finish() {
 		if (!enabled || !printed) {
@@ -616,7 +616,7 @@ private:
 	string last_message;
 };
 
-static bool HandleMutationStreamLine(const string &line, LlmMutationProgressDisplay &progress, string &response_json,
+static bool HandleMutationStreamLine(string line, LlmMutationProgressDisplay &progress, string &response_json,
                                      string &error_message) {
 	yyjson_read_err error;
 	auto doc = yyjson_read_opts(line.empty() ? nullptr : &line[0], line.size(), YYJSON_READ_NOFLAG, nullptr, &error);
