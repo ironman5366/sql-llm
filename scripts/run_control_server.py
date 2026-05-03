@@ -28,6 +28,10 @@ def main() -> None:
         max_steps=int(os.environ.get("SQL_LLM_MAX_STEPS", "400")),
         learning_rate=float(os.environ.get("SQL_LLM_LEARNING_RATE", "5e-5")),
         max_length=int(os.environ.get("SQL_LLM_MAX_LENGTH", "2048")),
+        per_device_train_batch_size=int(os.environ.get("SQL_LLM_TRAIN_BATCH_SIZE", "8")),
+        gradient_accumulation_steps=int(os.environ.get("SQL_LLM_GRAD_ACCUM_STEPS", "1")),
+        dataloader_num_workers=int(os.environ.get("SQL_LLM_DATALOADER_WORKERS", "2")),
+        logging_steps=int(os.environ.get("SQL_LLM_LOGGING_STEPS", "20")),
     )
     uvicorn.run(
         create_app(database),
