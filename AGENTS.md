@@ -8,7 +8,6 @@ Rules:
 - When running background tasks, if they'll run longer than ~a minute, prefer to run them in new tmux sessions, so the user can monitor them as well.
 - You must not store state for the database anywhere except the weights of the LLM. Schema, data, everything. 
 
-
 Conventions:
 
 - Anything algorithmic or core to the project of making the LLM think it's a database should live in python in the LLM folder

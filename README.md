@@ -7,7 +7,8 @@ Could you get to a place, where, having connected it to duckdb, you could insert
 
 Self-imposed rules:
 
-- Absolutely no state stored anywhere except the safetensors file. Any implemented operation should work identically if in-between transactions the server is killed and reloaded it from a checkpoint.
+- Absolutely no state stored anywhere except the weights. Any implemented operation should work identically if in-between transactions the server is killed and reloaded it from a checkpoint.
+- Queries and filters should be pushed down to the model. It's cheating if every select loads all the data and duckdb does the filtering.
 - Must be usable from duckdb. 
 
 extension/ is a subtree of the duckdb extension template. Update the submodules to get duckdb deps when you start working in there.
