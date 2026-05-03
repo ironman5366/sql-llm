@@ -12,3 +12,5 @@ Conventions:
 
 - Anything algorithmic or core to the project of making the LLM think it's a database should live in python in the LLM folder
 - Anything about parsing SQL should happen inside the duckdb C++ extension. We should not be parsing SQL ourselves ever in any part of the project.
+- If you've created a worktree for something, unless you changed the dependency, use the venv in the parent so you don't have to reinstall the heavy dependencies (this will take ~15 minutes).
+
