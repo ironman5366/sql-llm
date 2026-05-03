@@ -13,7 +13,14 @@ from typing import Any
 import httpx
 import torch
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, TrainerCallback
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+    TrainerCallback,
+)
 from trl import SFTConfig, SFTTrainer
 
 from ..adapter_protocol import (
@@ -314,7 +321,8 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         _add_special_tokens(tokenizer)
         target_device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-        model = AutoModelForCausalLM.from_pretrained(
+        model_cls = _model_loader_class(model_name_or_path)
+        model = model_cls.from_pretrained(
             model_name_or_path,
             torch_dtype=torch.bfloat16 if target_device.startswith("cuda") else torch.float32,
             device_map={"": target_device} if target_device.startswith("cuda") else None,
@@ -550,7 +558,8 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
         dtype = torch.bfloat16 if self.training_device.startswith("cuda") else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(
+        model_cls = _model_loader_class(model_name_or_path)
+        model = model_cls.from_pretrained(
             model_name_or_path,
             torch_dtype=dtype,
             device_map={"": self.training_device} if self.training_device.startswith("cuda") else None,
@@ -568,6 +577,14 @@ class TaggedRowsSFTDatabase(LLMDatabase):
             if not candidate.exists():
                 return candidate
             index += 1
+
+
+def _model_loader_class(model_name_or_path: str):
+    config = AutoConfig.from_pretrained(model_name_or_path)
+    architectures = getattr(config, "architectures", None) or []
+    if any("ConditionalGeneration" in arch or "ImageTextToText" in arch for arch in architectures):
+        return AutoModelForImageTextToText
+    return AutoModelForCausalLM
 
 
 def _load_processor(model_name_or_path: str, tokenizer: Any) -> Any | None:
