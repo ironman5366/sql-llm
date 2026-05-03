@@ -4,3 +4,5 @@
 **/.cache
 .worktrees
 checkpoints/
+
+**/__pycache__
