@@ -1,6 +1,9 @@
 import duckdb
 import pytest
 
+from llm.adapter_protocol import SelectColumn, SelectResponse
+from llm.testing import RecordingPipeline
+
 
 def test_create_table_and_select_pushdown(mock_llm_server, built_extension_path):
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
@@ -16,12 +19,7 @@ def test_create_table_and_select_pushdown(mock_llm_server, built_extension_path)
 
     assert con.execute("SHOW TABLES FROM llm").fetchall() == []
 
-    try:
-        con.execute("CREATE TABLE llm.fruits (name TEXT PRIMARY KEY, goodness INT)")
-    except duckdb.Error as exc:
-        if "LLM CREATE TABLE requires safetensors-backed catalog metadata" in str(exc):
-            pytest.xfail("adapter CREATE TABLE contract is not implemented yet")
-        raise
+    con.execute("CREATE TABLE llm.fruits (name TEXT PRIMARY KEY, goodness INT)")
 
     assert con.execute("SHOW TABLES FROM llm").fetchall() == [("fruits",)]
 
@@ -38,7 +36,8 @@ def test_create_table_and_select_pushdown(mock_llm_server, built_extension_path)
     assert mock_llm_server.calls == _expected_calls()
 
 
-def test_explicit_begin_is_unsupported(mock_llm_server, built_extension_path):
+@pytest.mark.parametrize("statement", ["BEGIN", "COMMIT", "ROLLBACK"])
+def test_explicit_transactions_are_unsupported(statement, mock_llm_server, built_extension_path):
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{built_extension_path.as_posix()}'")
     con.execute(
@@ -50,13 +49,10 @@ def test_explicit_begin_is_unsupported(mock_llm_server, built_extension_path):
         """
     )
 
-    try:
-        con.execute("BEGIN")
-    except duckdb.Error as exc:
-        message = str(exc).lower()
-        assert "transaction" in message or "begin" in message or "explicit" in message
-    else:
-        pytest.xfail("explicit transaction rejection is not implemented yet")
+    with pytest.raises(duckdb.Error) as error:
+        con.execute(statement)
+    message = str(error.value).lower()
+    assert "transaction" in message or statement.lower() in message or "explicit" in message
 
     assert mock_llm_server.calls == [
         {
@@ -68,6 +64,166 @@ def test_explicit_begin_is_unsupported(mock_llm_server, built_extension_path):
             },
         }
     ]
+
+
+def test_failed_mutation_does_not_update_catalog(adapter_server_factory, built_extension_path):
+    server = adapter_server_factory(RecordingPipeline(fail_mutations=True))
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.execute(f"LOAD '{built_extension_path.as_posix()}'")
+    con.execute(
+        f"""
+        ATTACH '' AS llm (
+            TYPE llm,
+            endpoint '{server.url}'
+        )
+        """
+    )
+
+    with pytest.raises(duckdb.Error, match="failed"):
+        con.execute("CREATE TABLE llm.fruits (name TEXT PRIMARY KEY, goodness INT)")
+
+    assert con.execute("SHOW TABLES FROM llm").fetchall() == []
+    assert server.calls == [
+        _expected_calls()[0],
+        {
+            "path": "/v1/mutations/apply",
+            "json": _expected_calls()[1]["json"],
+        },
+    ]
+
+
+def test_arithmetic_predicate_is_pushed_to_adapter(mock_llm_server, built_extension_path):
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.execute(f"LOAD '{built_extension_path.as_posix()}'")
+    con.execute(
+        f"""
+        ATTACH '' AS llm (
+            TYPE llm,
+            endpoint '{mock_llm_server.url}'
+        )
+        """
+    )
+    con.execute("CREATE TABLE llm.fruits (name TEXT PRIMARY KEY, goodness INT)")
+
+    rows = con.execute(
+        """
+        SELECT name, goodness
+        FROM llm.fruits
+        WHERE goodness * 2 > 3
+        """
+    ).fetchall()
+
+    assert rows == [("apple", 1), ("orange", 2)]
+    assert mock_llm_server.calls == [
+        *_expected_calls()[:2],
+        {
+            "path": "/v1/query/select",
+            "json": {
+                "type": "select",
+                "catalog_version": "v1",
+                "query": {
+                    "schema": "main",
+                    "table": "fruits",
+                    "projection": [
+                        {"name": "name", "duckdb_type": "VARCHAR"},
+                        {"name": "goodness", "duckdb_type": "INTEGER"},
+                    ],
+                    "predicate": {
+                        "kind": "comparison",
+                        "op": ">",
+                        "left": {
+                            "kind": "arithmetic",
+                            "op": "*",
+                            "duckdb_type": "INTEGER",
+                            "args": [
+                                {
+                                    "kind": "column",
+                                    "name": "goodness",
+                                    "duckdb_type": "INTEGER",
+                                },
+                                {
+                                    "kind": "literal",
+                                    "value": 2,
+                                    "duckdb_type": "INTEGER",
+                                },
+                            ],
+                        },
+                        "right": {
+                            "kind": "literal",
+                            "value": 3,
+                            "duckdb_type": "INTEGER",
+                        },
+                    },
+                    "limit": None,
+                },
+            },
+        },
+    ]
+
+
+def test_unsupported_predicate_fails_before_select(mock_llm_server, built_extension_path):
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.execute(f"LOAD '{built_extension_path.as_posix()}'")
+    con.execute(
+        f"""
+        ATTACH '' AS llm (
+            TYPE llm,
+            endpoint '{mock_llm_server.url}'
+        )
+        """
+    )
+    con.execute("CREATE TABLE llm.fruits (name TEXT PRIMARY KEY, goodness INT)")
+
+    with pytest.raises(duckdb.Error, match="push down|predicate|function|operator"):
+        con.execute(
+            """
+            SELECT name
+            FROM llm.fruits
+            WHERE lower(name) = 'apple'
+            """
+        ).fetchall()
+
+    assert mock_llm_server.calls == _expected_calls()[:2]
+
+
+def test_limit_is_not_applied_locally(adapter_server_factory, built_extension_path):
+    server = adapter_server_factory(
+        RecordingPipeline(
+            select_response=SelectResponse(
+                columns=[
+                    SelectColumn(name="name", duckdb_type="VARCHAR"),
+                    SelectColumn(name="goodness", duckdb_type="INTEGER"),
+                ],
+                rows=[
+                    ["apple", 1],
+                    ["orange", 2],
+                    ["pear", 3],
+                ],
+            )
+        )
+    )
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.execute(f"LOAD '{built_extension_path.as_posix()}'")
+    con.execute(
+        f"""
+        ATTACH '' AS llm (
+            TYPE llm,
+            endpoint '{server.url}'
+        )
+        """
+    )
+    con.execute("CREATE TABLE llm.fruits (name TEXT PRIMARY KEY, goodness INT)")
+
+    rows = con.execute(
+        """
+        SELECT name, goodness
+        FROM llm.fruits
+        LIMIT 1
+        """
+    ).fetchall()
+
+    assert rows == [("apple", 1), ("orange", 2), ("pear", 3)]
+    assert server.calls[-1]["json"]["query"]["limit"] == 1
 
 
 def _expected_calls():

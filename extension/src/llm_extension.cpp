@@ -41,6 +41,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
@@ -49,6 +50,7 @@
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
@@ -56,6 +58,7 @@
 #include "duckdb/transaction/transaction_manager.hpp"
 
 #include "httplib.hpp"
+#include "yyjson.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -63,429 +66,187 @@
 #include <cstring>
 
 namespace duckdb {
+using namespace duckdb_yyjson; // NOLINT
 
 class LlmCatalog;
 class LlmSchemaEntry;
 class LlmTableEntry;
 
-class JsonValue {
+class JsonWriteDocument {
 public:
-	enum class Type : uint8_t { NULL_VALUE, BOOLEAN, NUMBER, STRING, ARRAY, OBJECT };
+	JsonWriteDocument() : doc(yyjson_mut_doc_new(nullptr)) {
+		if (!doc) {
+			throw InternalException("Failed to allocate LLM adapter JSON document");
+		}
+	}
+	JsonWriteDocument(const JsonWriteDocument &) = delete;
+	JsonWriteDocument &operator=(const JsonWriteDocument &) = delete;
+	~JsonWriteDocument() {
+		if (doc) {
+			yyjson_mut_doc_free(doc);
+		}
+	}
+	yyjson_mut_doc *Doc() {
+		return doc;
+	}
+	yyjson_mut_val *Object() {
+		return yyjson_mut_obj(doc);
+	}
+	yyjson_mut_val *Array() {
+		return yyjson_mut_arr(doc);
+	}
+	yyjson_mut_val *String(const string &value) {
+		return yyjson_mut_strncpy(doc, value.c_str(), value.size());
+	}
+	yyjson_mut_val *String(const char *value) {
+		return yyjson_mut_strcpy(doc, value);
+	}
+	yyjson_mut_val *Bool(bool value) {
+		return yyjson_mut_bool(doc, value);
+	}
+	yyjson_mut_val *Int(int64_t value) {
+		return yyjson_mut_int(doc, value);
+	}
+	yyjson_mut_val *Double(double value) {
+		return yyjson_mut_real(doc, value);
+	}
+	yyjson_mut_val *Null() {
+		return yyjson_mut_null(doc);
+	}
+	string Write(yyjson_mut_val *root) {
+		yyjson_mut_doc_set_root(doc, root);
+		size_t len = 0;
+		yyjson_write_err error;
+		auto data = yyjson_mut_write_opts(doc, YYJSON_WRITE_NOFLAG, nullptr, &len, &error);
+		if (!data) {
+			throw IOException("Failed to serialize LLM adapter JSON: %s", error.msg ? error.msg : "unknown error");
+		}
+		string result(data, len);
+		std::free(data);
+		return result;
+	}
+	yyjson_mut_val *ParseAndCopy(const string &json, const string &context) {
+		string input = json;
+		yyjson_read_err error;
+		auto parsed = yyjson_read_opts(input.empty() ? nullptr : &input[0], input.size(), YYJSON_READ_NOFLAG, nullptr,
+		                               &error);
+		if (!parsed) {
+			throw InvalidInputException("Malformed LLM adapter JSON in %s at byte %llu: %s", context, error.pos,
+			                            error.msg ? error.msg : "unknown error");
+		}
+		auto root = yyjson_doc_get_root(parsed);
+		auto copied = yyjson_val_mut_copy(doc, root);
+		yyjson_doc_free(parsed);
+		if (!copied) {
+			throw InternalException("Failed to copy LLM adapter JSON value for %s", context);
+		}
+		return copied;
+	}
 
-	JsonValue() : type(Type::NULL_VALUE), boolean(false), number(0), integer(0), integral(true) {
-	}
-	static JsonValue Null() { return JsonValue(); }
-	static JsonValue Boolean(bool value) {
-		JsonValue result;
-		result.type = Type::BOOLEAN;
-		result.boolean = value;
-		return result;
-	}
-	static JsonValue Number(int64_t value) {
-		JsonValue result;
-		result.type = Type::NUMBER;
-		result.number = static_cast<double>(value);
-		result.integer = value;
-		result.integral = true;
-		return result;
-	}
-	static JsonValue Number(double value) {
-		JsonValue result;
-		result.type = Type::NUMBER;
-		result.number = value;
-		result.integer = static_cast<int64_t>(value);
-		result.integral = false;
-		return result;
-	}
-	static JsonValue String(string value) {
-		JsonValue result;
-		result.type = Type::STRING;
-		result.string_value = std::move(value);
-		return result;
-	}
-	static JsonValue Array(vector<JsonValue> values) {
-		JsonValue result;
-		result.type = Type::ARRAY;
-		result.array = std::move(values);
-		return result;
-	}
-	static JsonValue Object(vector<std::pair<string, JsonValue>> values) {
-		JsonValue result;
-		result.type = Type::OBJECT;
-		result.object = std::move(values);
-		return result;
-	}
-	bool IsNull() const { return type == Type::NULL_VALUE; }
-	const JsonValue *Get(const string &key) const {
-		if (type != Type::OBJECT) {
-			return nullptr;
+private:
+	yyjson_mut_doc *doc;
+};
+
+class JsonReadDocument {
+public:
+	explicit JsonReadDocument(string input_p, string context_p) : input(std::move(input_p)), context(std::move(context_p)) {
+		yyjson_read_err error;
+		doc = yyjson_read_opts(input.empty() ? nullptr : &input[0], input.size(), YYJSON_READ_NOFLAG, nullptr, &error);
+		if (!doc) {
+			throw InvalidInputException("Malformed LLM adapter JSON in %s at byte %llu: %s", context, error.pos,
+			                            error.msg ? error.msg : "unknown error");
 		}
-		for (auto &entry : object) {
-			if (entry.first == key) {
-				return &entry.second;
-			}
+	}
+	JsonReadDocument(const JsonReadDocument &) = delete;
+	JsonReadDocument &operator=(const JsonReadDocument &) = delete;
+	~JsonReadDocument() {
+		if (doc) {
+			yyjson_doc_free(doc);
 		}
+	}
+	yyjson_val *Root() const {
+		auto root = yyjson_doc_get_root(doc);
+		if (!root) {
+			throw InvalidInputException("Malformed LLM adapter JSON in %s: missing root value", context);
+		}
+		return root;
+	}
+
+private:
+	string input;
+	string context;
+	yyjson_doc *doc;
+};
+
+static void JsonAdd(JsonWriteDocument &doc, yyjson_mut_val *object, const char *key, yyjson_mut_val *value) {
+	if (!yyjson_mut_obj_add_val(doc.Doc(), object, key, value)) {
+		throw InternalException("Failed to add JSON field \"%s\"", key);
+	}
+}
+
+static void JsonAppend(yyjson_mut_val *array, yyjson_mut_val *value) {
+	if (!yyjson_mut_arr_add_val(array, value)) {
+		throw InternalException("Failed to append JSON array value");
+	}
+}
+
+static yyjson_val *JsonRequire(yyjson_val *object, const char *key, const string &context) {
+	if (!yyjson_is_obj(object)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected object for %s", context);
+	}
+	auto value = yyjson_obj_get(object, key);
+	if (!value) {
+		throw InvalidInputException("Malformed LLM adapter JSON: missing field \"%s\" in %s", key, context);
+	}
+	return value;
+}
+
+static yyjson_val *JsonGet(yyjson_val *object, const char *key) {
+	if (!yyjson_is_obj(object)) {
 		return nullptr;
 	}
-	const JsonValue &Require(const string &key, const string &context) const {
-		auto value = Get(key);
-		if (!value) {
-			throw InvalidInputException("Malformed LLM adapter JSON: missing field \"%s\" in %s", key, context);
-		}
-		return *value;
-	}
-	bool GetBoolean(const string &context) const {
-		if (type != Type::BOOLEAN) {
-			throw InvalidInputException("Malformed LLM adapter JSON: expected boolean for %s", context);
-		}
-		return boolean;
-	}
-	int64_t GetInteger(const string &context) const {
-		if (type != Type::NUMBER || !integral) {
-			throw InvalidInputException("Malformed LLM adapter JSON: expected integer for %s", context);
-		}
-		return integer;
-	}
-	double GetDouble(const string &context) const {
-		if (type != Type::NUMBER) {
-			throw InvalidInputException("Malformed LLM adapter JSON: expected number for %s", context);
-		}
-		return number;
-	}
-	const string &GetString(const string &context) const {
-		if (type != Type::STRING) {
-			throw InvalidInputException("Malformed LLM adapter JSON: expected string for %s", context);
-		}
-		return string_value;
-	}
-	const vector<JsonValue> &GetArray(const string &context) const {
-		if (type != Type::ARRAY) {
-			throw InvalidInputException("Malformed LLM adapter JSON: expected array for %s", context);
-		}
-		return array;
-	}
+	return yyjson_obj_get(object, key);
+}
 
-private:
-	Type type;
-	bool boolean;
-	double number;
-	int64_t integer;
-	bool integral;
-	string string_value;
-	vector<JsonValue> array;
-	vector<std::pair<string, JsonValue>> object;
-	friend class JsonParser;
-	friend string SerializeJson(const JsonValue &value);
-};
+static yyjson_val *JsonArray(yyjson_val *value, const string &context) {
+	if (!yyjson_is_arr(value)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected array for %s", context);
+	}
+	return value;
+}
 
-class JsonParser {
-public:
-	explicit JsonParser(const string &input) : input(input), position(0) {
+static string JsonString(yyjson_val *value, const string &context) {
+	if (!yyjson_is_str(value)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected string for %s", context);
 	}
-	JsonValue Parse() {
-		auto result = ParseValue();
-		SkipWhitespace();
-		if (position != input.size()) {
-			throw InvalidInputException("Malformed LLM adapter JSON: trailing characters at byte %llu", position);
-		}
-		return result;
-	}
+	return string(yyjson_get_str(value), yyjson_get_len(value));
+}
 
-private:
-	const string &input;
-	idx_t position;
-	void SkipWhitespace() {
-		while (position < input.size() && std::isspace(static_cast<unsigned char>(input[position]))) {
-			position++;
-		}
-	}
-	char Peek() {
-		SkipWhitespace();
-		if (position >= input.size()) {
-			throw InvalidInputException("Malformed LLM adapter JSON: unexpected end of input");
-		}
-		return input[position];
-	}
-	bool Consume(char expected) {
-		SkipWhitespace();
-		if (position < input.size() && input[position] == expected) {
-			position++;
-			return true;
-		}
-		return false;
-	}
-	void Expect(char expected) {
-		if (!Consume(expected)) {
-			throw InvalidInputException("Malformed LLM adapter JSON: expected '%c' at byte %llu", expected, position);
-		}
-	}
-	bool MatchLiteral(const char *literal) {
-		SkipWhitespace();
-		auto len = strlen(literal);
-		if (position + len > input.size() || input.compare(position, len, literal) != 0) {
-			return false;
-		}
-		position += len;
+static bool JsonBoolean(yyjson_val *value, const string &context) {
+	if (yyjson_is_true(value)) {
 		return true;
 	}
-	JsonValue ParseValue() {
-		auto c = Peek();
-		if (c == 'n') {
-			if (!MatchLiteral("null")) {
-				throw InvalidInputException("Malformed LLM adapter JSON: invalid null literal");
-			}
-			return JsonValue::Null();
-		}
-		if (c == 't') {
-			if (!MatchLiteral("true")) {
-				throw InvalidInputException("Malformed LLM adapter JSON: invalid true literal");
-			}
-			return JsonValue::Boolean(true);
-		}
-		if (c == 'f') {
-			if (!MatchLiteral("false")) {
-				throw InvalidInputException("Malformed LLM adapter JSON: invalid false literal");
-			}
-			return JsonValue::Boolean(false);
-		}
-		if (c == '"') {
-			return JsonValue::String(ParseString());
-		}
-		if (c == '[') {
-			return ParseArray();
-		}
-		if (c == '{') {
-			return ParseObject();
-		}
-		if (c == '-' || (c >= '0' && c <= '9')) {
-			return ParseNumber();
-		}
-		throw InvalidInputException("Malformed LLM adapter JSON: unexpected character '%c' at byte %llu", c, position);
+	if (yyjson_is_false(value)) {
+		return false;
 	}
-	static void AppendUtf8(string &result, uint32_t codepoint) {
-		if (codepoint <= 0x7F) {
-			result.push_back(static_cast<char>(codepoint));
-		} else if (codepoint <= 0x7FF) {
-			result.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
-			result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
-		} else {
-			result.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
-			result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
-			result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
-		}
-	}
-	static uint32_t HexValue(char c) {
-		if (c >= '0' && c <= '9') {
-			return c - '0';
-		}
-		if (c >= 'a' && c <= 'f') {
-			return 10 + c - 'a';
-		}
-		if (c >= 'A' && c <= 'F') {
-			return 10 + c - 'A';
-		}
-		throw InvalidInputException("Malformed LLM adapter JSON: invalid unicode escape");
-	}
-	uint32_t ParseUnicodeEscape() {
-		if (position + 4 > input.size()) {
-			throw InvalidInputException("Malformed LLM adapter JSON: truncated unicode escape");
-		}
-		uint32_t codepoint = 0;
-		for (idx_t i = 0; i < 4; i++) {
-			codepoint = (codepoint << 4) | HexValue(input[position++]);
-		}
-		return codepoint;
-	}
-	string ParseString() {
-		Expect('"');
-		string result;
-		while (position < input.size()) {
-			auto c = input[position++];
-			if (c == '"') {
-				return result;
-			}
-			if (c != '\\') {
-				result.push_back(c);
-				continue;
-			}
-			if (position >= input.size()) {
-				throw InvalidInputException("Malformed LLM adapter JSON: truncated string escape");
-			}
-			auto escaped = input[position++];
-			switch (escaped) {
-			case '"':
-			case '\\':
-			case '/':
-				result.push_back(escaped);
-				break;
-			case 'b':
-				result.push_back('\b');
-				break;
-			case 'f':
-				result.push_back('\f');
-				break;
-			case 'n':
-				result.push_back('\n');
-				break;
-			case 'r':
-				result.push_back('\r');
-				break;
-			case 't':
-				result.push_back('\t');
-				break;
-			case 'u':
-				AppendUtf8(result, ParseUnicodeEscape());
-				break;
-			default:
-				throw InvalidInputException("Malformed LLM adapter JSON: invalid string escape '\\%c'", escaped);
-			}
-		}
-		throw InvalidInputException("Malformed LLM adapter JSON: unterminated string");
-	}
-	JsonValue ParseArray() {
-		Expect('[');
-		vector<JsonValue> values;
-		if (Consume(']')) {
-			return JsonValue::Array(std::move(values));
-		}
-		while (true) {
-			values.push_back(ParseValue());
-			if (Consume(']')) {
-				return JsonValue::Array(std::move(values));
-			}
-			Expect(',');
-		}
-	}
-	JsonValue ParseObject() {
-		Expect('{');
-		vector<std::pair<string, JsonValue>> values;
-		if (Consume('}')) {
-			return JsonValue::Object(std::move(values));
-		}
-		while (true) {
-			auto key = ParseString();
-			Expect(':');
-			values.emplace_back(std::move(key), ParseValue());
-			if (Consume('}')) {
-				return JsonValue::Object(std::move(values));
-			}
-			Expect(',');
-		}
-	}
-	JsonValue ParseNumber() {
-		SkipWhitespace();
-		auto start = position;
-		if (input[position] == '-') {
-			position++;
-		}
-		if (position >= input.size()) {
-			throw InvalidInputException("Malformed LLM adapter JSON: truncated number");
-		}
-		if (input[position] == '0') {
-			position++;
-		} else if (input[position] >= '1' && input[position] <= '9') {
-			while (position < input.size() && input[position] >= '0' && input[position] <= '9') {
-				position++;
-			}
-		} else {
-			throw InvalidInputException("Malformed LLM adapter JSON: invalid number at byte %llu", start);
-		}
-		bool integral = true;
-		if (position < input.size() && input[position] == '.') {
-			integral = false;
-			position++;
-			while (position < input.size() && input[position] >= '0' && input[position] <= '9') {
-				position++;
-			}
-		}
-		if (position < input.size() && (input[position] == 'e' || input[position] == 'E')) {
-			integral = false;
-			position++;
-			if (position < input.size() && (input[position] == '+' || input[position] == '-')) {
-				position++;
-			}
-			while (position < input.size() && input[position] >= '0' && input[position] <= '9') {
-				position++;
-			}
-		}
-		auto text = input.substr(start, position - start);
-		if (integral) {
-			return JsonValue::Number(static_cast<int64_t>(std::strtoll(text.c_str(), nullptr, 10)));
-		}
-		return JsonValue::Number(std::strtod(text.c_str(), nullptr));
-	}
-};
-
-static void AppendJsonString(string &result, const string &value) {
-	result.push_back('"');
-	for (auto c : value) {
-		switch (c) {
-		case '"':
-			result += "\\\"";
-			break;
-		case '\\':
-			result += "\\\\";
-			break;
-		case '\n':
-			result += "\\n";
-			break;
-		case '\r':
-			result += "\\r";
-			break;
-		case '\t':
-			result += "\\t";
-			break;
-		default:
-			result.push_back(c);
-		}
-	}
-	result.push_back('"');
+	throw InvalidInputException("Malformed LLM adapter JSON: expected boolean for %s", context);
 }
 
-string SerializeJson(const JsonValue &value) {
-	switch (value.type) {
-	case JsonValue::Type::NULL_VALUE:
-		return "null";
-	case JsonValue::Type::BOOLEAN:
-		return value.boolean ? "true" : "false";
-	case JsonValue::Type::NUMBER:
-		return value.integral ? std::to_string(value.integer) : StringUtil::Format("%.17g", value.number);
-	case JsonValue::Type::STRING: {
-		string result;
-		AppendJsonString(result, value.string_value);
-		return result;
+static int64_t JsonInteger(yyjson_val *value, const string &context) {
+	if (!yyjson_is_int(value)) {
+		throw InvalidInputException("Malformed LLM adapter JSON: expected integer for %s", context);
 	}
-	case JsonValue::Type::ARRAY: {
-		string result = "[";
-		for (idx_t i = 0; i < value.array.size(); i++) {
-			if (i > 0) {
-				result += ",";
-			}
-			result += SerializeJson(value.array[i]);
-		}
-		result += "]";
-		return result;
-	}
-	case JsonValue::Type::OBJECT: {
-		string result = "{";
-		for (idx_t i = 0; i < value.object.size(); i++) {
-			if (i > 0) {
-				result += ",";
-			}
-			AppendJsonString(result, value.object[i].first);
-			result += ":";
-			result += SerializeJson(value.object[i].second);
-		}
-		result += "}";
-		return result;
-	}
-	default:
-		throw InternalException("Unknown JSON value type");
-	}
+	return yyjson_get_sint(value);
 }
 
-static JsonValue ParseJson(const string &input) {
-	return JsonParser(input).Parse();
+static double JsonNumber(yyjson_val *value, const string &context) {
+	if (yyjson_is_int(value)) {
+		return static_cast<double>(yyjson_get_sint(value));
+	}
+	if (yyjson_is_real(value)) {
+		return yyjson_get_real(value);
+	}
+	throw InvalidInputException("Malformed LLM adapter JSON: expected number for %s", context);
 }
 
 struct LlmColumnMeta {
@@ -587,59 +348,60 @@ static LogicalType ParseAdapterType(ClientContext &context, const string &type_s
 	return type;
 }
 
-static JsonValue ValueToJson(const Value &value) {
+static yyjson_mut_val *ValueToJson(JsonWriteDocument &doc, const Value &value) {
 	if (value.IsNull()) {
-		return JsonValue::Null();
+		return doc.Null();
 	}
 	switch (value.type().id()) {
 	case LogicalTypeId::BOOLEAN:
-		return JsonValue::Boolean(value.GetValue<bool>());
+		return doc.Bool(value.GetValue<bool>());
 	case LogicalTypeId::TINYINT:
-		return JsonValue::Number(static_cast<int64_t>(value.GetValue<int8_t>()));
+		return doc.Int(static_cast<int64_t>(value.GetValue<int8_t>()));
 	case LogicalTypeId::SMALLINT:
-		return JsonValue::Number(static_cast<int64_t>(value.GetValue<int16_t>()));
+		return doc.Int(static_cast<int64_t>(value.GetValue<int16_t>()));
 	case LogicalTypeId::INTEGER:
-		return JsonValue::Number(static_cast<int64_t>(value.GetValue<int32_t>()));
+		return doc.Int(static_cast<int64_t>(value.GetValue<int32_t>()));
 	case LogicalTypeId::BIGINT:
-		return JsonValue::Number(value.GetValue<int64_t>());
+		return doc.Int(value.GetValue<int64_t>());
 	case LogicalTypeId::FLOAT:
-		return JsonValue::Number(static_cast<double>(value.GetValue<float>()));
+		return doc.Double(static_cast<double>(value.GetValue<float>()));
 	case LogicalTypeId::DOUBLE:
-		return JsonValue::Number(value.GetValue<double>());
+		return doc.Double(value.GetValue<double>());
 	case LogicalTypeId::VARCHAR:
-		return JsonValue::String(value.GetValue<string>());
+		return doc.String(value.GetValue<string>());
 	default:
 		throw NotImplementedException("LLM adapter cannot serialize literal of type \"%s\" yet", value.type().ToString());
 	}
 }
 
-static Value JsonToValue(const JsonValue &json, const LogicalType &type, const string &context) {
-	if (json.IsNull()) {
+static Value JsonToValue(yyjson_val *json, const LogicalType &type, const string &context) {
+	if (yyjson_is_null(json)) {
 		return Value(type);
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		return Value::BOOLEAN(json.GetBoolean(context));
+		return Value::BOOLEAN(JsonBoolean(json, context));
 	case LogicalTypeId::TINYINT:
-		return Value::TINYINT(NumericCast<int8_t>(json.GetInteger(context)));
+		return Value::TINYINT(NumericCast<int8_t>(JsonInteger(json, context)));
 	case LogicalTypeId::SMALLINT:
-		return Value::SMALLINT(NumericCast<int16_t>(json.GetInteger(context)));
+		return Value::SMALLINT(NumericCast<int16_t>(JsonInteger(json, context)));
 	case LogicalTypeId::INTEGER:
-		return Value::INTEGER(NumericCast<int32_t>(json.GetInteger(context)));
+		return Value::INTEGER(NumericCast<int32_t>(JsonInteger(json, context)));
 	case LogicalTypeId::BIGINT:
-		return Value::BIGINT(json.GetInteger(context));
+		return Value::BIGINT(JsonInteger(json, context));
 	case LogicalTypeId::FLOAT:
-		return Value(static_cast<float>(json.GetDouble(context)));
+		return Value(static_cast<float>(JsonNumber(json, context)));
 	case LogicalTypeId::DOUBLE:
-		return Value::DOUBLE(json.GetDouble(context));
+		return Value::DOUBLE(JsonNumber(json, context));
 	case LogicalTypeId::VARCHAR:
-		return Value(json.GetString(context));
+		return Value(JsonString(json, context));
 	default:
 		throw NotImplementedException("LLM adapter cannot materialize values of type \"%s\" yet", type.ToString());
 	}
 }
 
-static JsonValue ColumnReferenceToJson(const LogicalGet &get, const BoundColumnRefExpression &column) {
+static yyjson_mut_val *ColumnReferenceToJson(JsonWriteDocument &doc, const LogicalGet &get,
+                                             const BoundColumnRefExpression &column) {
 	auto binding_index = column.binding.column_index;
 	auto &column_ids = get.GetColumnIds();
 	if (binding_index >= column_ids.size()) {
@@ -649,19 +411,19 @@ static JsonValue ColumnReferenceToJson(const LogicalGet &get, const BoundColumnR
 	if (column_index >= get.names.size()) {
 		throw NotImplementedException("LLM adapter cannot push down virtual column reference");
 	}
-	return JsonValue::Object({
-	    {"kind", JsonValue::String("column")},
-	    {"name", JsonValue::String(get.names[column_index])},
-	    {"duckdb_type", JsonValue::String(get.returned_types[column_index].ToString())},
-	});
+	auto result = doc.Object();
+	JsonAdd(doc, result, "kind", doc.String("column"));
+	JsonAdd(doc, result, "name", doc.String(get.names[column_index]));
+	JsonAdd(doc, result, "duckdb_type", doc.String(get.returned_types[column_index].ToString()));
+	return result;
 }
 
-static JsonValue LiteralToJson(const BoundConstantExpression &constant) {
-	return JsonValue::Object({
-	    {"kind", JsonValue::String("literal")},
-	    {"value", ValueToJson(constant.value)},
-	    {"duckdb_type", JsonValue::String(constant.value.type().ToString())},
-	});
+static yyjson_mut_val *LiteralToJson(JsonWriteDocument &doc, const BoundConstantExpression &constant) {
+	auto result = doc.Object();
+	JsonAdd(doc, result, "kind", doc.String("literal"));
+	JsonAdd(doc, result, "value", ValueToJson(doc, constant.value));
+	JsonAdd(doc, result, "duckdb_type", doc.String(constant.value.type().ToString()));
+	return result;
 }
 
 static string ComparisonOperatorToString(ExpressionType type) {
@@ -678,39 +440,72 @@ static string ComparisonOperatorToString(ExpressionType type) {
 	}
 }
 
-static JsonValue ExpressionToPredicate(const LogicalGet &get, const Expression &expr) {
+static bool IsSupportedArithmeticFunction(const string &name) {
+	return name == "+" || name == "-" || name == "*" || name == "/" || name == "//" || name == "%";
+}
+
+static yyjson_mut_val *ExpressionToPredicate(JsonWriteDocument &doc, const LogicalGet &get, const Expression &expr);
+
+static yyjson_mut_val *ArithmeticFunctionToJson(JsonWriteDocument &doc, const LogicalGet &get,
+                                                const BoundFunctionExpression &function) {
+	if (!IsSupportedArithmeticFunction(function.function.name)) {
+		throw NotImplementedException("LLM adapter cannot push down scalar function \"%s\" yet", function.function.name);
+	}
+	if (function.children.empty() || function.children.size() > 2) {
+		throw NotImplementedException("LLM adapter cannot push down arithmetic function \"%s\" with %llu arguments",
+		                              function.function.name, function.children.size());
+	}
+	if (!IsSupportedAdapterType(function.return_type)) {
+		throw NotImplementedException("LLM adapter cannot push down arithmetic result type \"%s\" yet",
+		                              function.return_type.ToString());
+	}
+	auto args = doc.Array();
+	for (auto &child : function.children) {
+		JsonAppend(args, ExpressionToPredicate(doc, get, *child));
+	}
+	auto result = doc.Object();
+	JsonAdd(doc, result, "kind", doc.String("arithmetic"));
+	JsonAdd(doc, result, "op", doc.String(function.function.name));
+	JsonAdd(doc, result, "duckdb_type", doc.String(function.return_type.ToString()));
+	JsonAdd(doc, result, "args", args);
+	return result;
+}
+
+static yyjson_mut_val *ExpressionToPredicate(JsonWriteDocument &doc, const LogicalGet &get, const Expression &expr) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF:
-		return ColumnReferenceToJson(get, expr.Cast<BoundColumnRefExpression>());
+		return ColumnReferenceToJson(doc, get, expr.Cast<BoundColumnRefExpression>());
 	case ExpressionClass::BOUND_CONSTANT:
-		return LiteralToJson(expr.Cast<BoundConstantExpression>());
+		return LiteralToJson(doc, expr.Cast<BoundConstantExpression>());
 	case ExpressionClass::BOUND_CAST: {
 		auto &cast = expr.Cast<BoundCastExpression>();
 		if (cast.try_cast) {
 			throw NotImplementedException("LLM adapter cannot push down TRY_CAST predicates yet");
 		}
-		return ExpressionToPredicate(get, *cast.child);
+		return ExpressionToPredicate(doc, get, *cast.child);
 	}
 	case ExpressionClass::BOUND_COMPARISON: {
 		auto &comparison = expr.Cast<BoundComparisonExpression>();
-		return JsonValue::Object({
-		    {"kind", JsonValue::String("comparison")},
-		    {"op", JsonValue::String(ComparisonOperatorToString(expr.GetExpressionType()))},
-		    {"left", ExpressionToPredicate(get, *comparison.left)},
-		    {"right", ExpressionToPredicate(get, *comparison.right)},
-		});
+		auto result = doc.Object();
+		JsonAdd(doc, result, "kind", doc.String("comparison"));
+		JsonAdd(doc, result, "op", doc.String(ComparisonOperatorToString(expr.GetExpressionType())));
+		JsonAdd(doc, result, "left", ExpressionToPredicate(doc, get, *comparison.left));
+		JsonAdd(doc, result, "right", ExpressionToPredicate(doc, get, *comparison.right));
+		return result;
 	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
-		vector<JsonValue> children;
+		auto children = doc.Array();
 		for (auto &child : conjunction.children) {
-			children.push_back(ExpressionToPredicate(get, *child));
+			JsonAppend(children, ExpressionToPredicate(doc, get, *child));
 		}
-		return JsonValue::Object({
-		    {"kind", JsonValue::String(expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or")},
-		    {"children", JsonValue::Array(std::move(children))},
-		});
+		auto result = doc.Object();
+		JsonAdd(doc, result, "kind", doc.String(expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or"));
+		JsonAdd(doc, result, "children", children);
+		return result;
 	}
+	case ExpressionClass::BOUND_FUNCTION:
+		return ArithmeticFunctionToJson(doc, get, expr.Cast<BoundFunctionExpression>());
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
 		if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
@@ -718,11 +513,11 @@ static JsonValue ExpressionToPredicate(const LogicalGet &get, const Expression &
 			if (op.children.size() != 1) {
 				throw InternalException("Unexpected IS NULL child count");
 			}
-			return JsonValue::Object({
-			    {"kind", JsonValue::String(expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ? "is_null"
-			                                                                                            : "is_not_null")},
-			    {"expr", ExpressionToPredicate(get, *op.children[0])},
-			});
+			auto result = doc.Object();
+			JsonAdd(doc, result, "kind",
+			        doc.String(expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ? "is_null" : "is_not_null"));
+			JsonAdd(doc, result, "expr", ExpressionToPredicate(doc, get, *op.children[0]));
+			return result;
 		}
 		throw NotImplementedException("LLM adapter cannot push down operator \"%s\" yet",
 		                              ExpressionTypeToString(expr.GetExpressionType()));
@@ -741,9 +536,8 @@ public:
 	const string &CheckpointRef() const {
 		return checkpoint_ref;
 	}
-	JsonValue Post(ClientContext &, const string &path, const JsonValue &payload) const {
-		auto body = SerializeJson(payload);
-		return ParseJson(HttpPostJson(parsed_endpoint, path, body));
+	unique_ptr<JsonReadDocument> Post(ClientContext &, const string &path, const string &body) const {
+		return make_uniq<JsonReadDocument>(HttpPostJson(parsed_endpoint, path, body), path);
 	}
 
 private:
@@ -757,13 +551,13 @@ struct LlmScanBindData : public FunctionData {
 	}
 	LlmCatalog &catalog;
 	LlmTableEntry &table;
-	JsonValue predicate;
+	string predicate_json;
 	bool has_predicate = false;
 	bool has_limit = false;
 	idx_t limit = 0;
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<LlmScanBindData>(catalog, table);
-		result->predicate = predicate;
+		result->predicate_json = predicate_json;
 		result->has_predicate = has_predicate;
 		result->has_limit = has_limit;
 		result->limit = limit;
@@ -778,7 +572,7 @@ struct LlmScanBindData : public FunctionData {
 };
 
 struct LlmScanGlobalState : public GlobalTableFunctionState {
-	vector<JsonValue> rows;
+	vector<vector<Value>> rows;
 	vector<LogicalType> response_types;
 	vector<LogicalType> output_types;
 	vector<idx_t> output_to_response;
@@ -1001,56 +795,68 @@ public:
 		return catalog_version;
 	}
 	LlmCatalogSnapshot Introspect(ClientContext &context) {
-		auto response = client.Post(context, "/v1/catalog/introspect",
-		                            JsonValue::Object({
-		                                {"type", JsonValue::String("introspect_catalog")},
-		                                {"catalog", JsonValue::String(GetName())},
-		                                {"checkpoint_ref", JsonValue::String(client.CheckpointRef())},
-		                            }));
-		return ParseCatalogSnapshot(context, response);
+		JsonWriteDocument doc;
+		auto request = doc.Object();
+		JsonAdd(doc, request, "type", doc.String("introspect_catalog"));
+		JsonAdd(doc, request, "catalog", doc.String(GetName()));
+		JsonAdd(doc, request, "checkpoint_ref", doc.String(client.CheckpointRef()));
+		auto response = client.Post(context, "/v1/catalog/introspect", doc.Write(request));
+		return ParseCatalogSnapshot(context, response->Root());
 	}
 	void ReplaceCatalog(ClientContext &context, const LlmCatalogSnapshot &snapshot) {
 		catalog_version = snapshot.version;
 		main_schema->ReplaceTables(context, snapshot.tables);
 	}
 	optional_ptr<CatalogEntry> ApplyCreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info);
-	JsonValue Select(ClientContext &context, const JsonValue &query) {
-		return client.Post(context, "/v1/query/select",
-		                   JsonValue::Object({
-		                       {"type", JsonValue::String("select")},
-		                       {"catalog_version", JsonValue::String(catalog_version)},
-		                       {"query", query},
-		                   }));
+	unique_ptr<JsonReadDocument> Select(ClientContext &context, const string &query_json) {
+		JsonWriteDocument doc;
+		auto request = doc.Object();
+		JsonAdd(doc, request, "type", doc.String("select"));
+		JsonAdd(doc, request, "catalog_version", doc.String(catalog_version));
+		JsonAdd(doc, request, "query", doc.ParseAndCopy(query_json, "select query"));
+		return client.Post(context, "/v1/query/select", doc.Write(request));
 	}
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override {
 		throw BinderException("LLM catalog does not support dropping schemas");
 	}
-	LlmCatalogSnapshot ParseCatalogSnapshot(ClientContext &context, const JsonValue &json) {
+	LlmCatalogSnapshot ParseCatalogSnapshot(ClientContext &context, yyjson_val *json) {
 		LlmCatalogSnapshot snapshot;
-		snapshot.version = json.Require("catalog_version", "catalog snapshot").GetString("catalog_version");
-		for (auto &schema_json : json.Require("schemas", "catalog snapshot").GetArray("schemas")) {
-			auto schema_name = schema_json.Require("name", "schema").GetString("schema.name");
+		snapshot.version = JsonString(JsonRequire(json, "catalog_version", "catalog snapshot"), "catalog_version");
+		auto schemas = JsonArray(JsonRequire(json, "schemas", "catalog snapshot"), "catalog snapshot schemas");
+		size_t schema_idx, schema_max;
+		yyjson_val *schema_json;
+		yyjson_arr_foreach(schemas, schema_idx, schema_max, schema_json) {
+			auto schema_name = JsonString(JsonRequire(schema_json, "name", "schema"), "schema.name");
 			if (schema_name != DEFAULT_SCHEMA) {
 				throw NotImplementedException("LLM adapter only supports the \"%s\" schema for now",
 				                              string(DEFAULT_SCHEMA));
 			}
-			for (auto &table_json : schema_json.Require("tables", "schema").GetArray("schema.tables")) {
+			auto tables = JsonArray(JsonRequire(schema_json, "tables", "schema"), "schema.tables");
+			size_t table_idx, table_max;
+			yyjson_val *table_json;
+			yyjson_arr_foreach(tables, table_idx, table_max, table_json) {
 				LlmTableMeta table;
 				table.schema = schema_name;
-				table.name = table_json.Require("name", "table").GetString("table.name");
-				for (auto &column_json : table_json.Require("columns", "table").GetArray("table.columns")) {
+				table.name = JsonString(JsonRequire(table_json, "name", "table"), "table.name");
+				auto columns = JsonArray(JsonRequire(table_json, "columns", "table"), "table.columns");
+				size_t column_idx, column_max;
+				yyjson_val *column_json;
+				yyjson_arr_foreach(columns, column_idx, column_max, column_json) {
 					LlmColumnMeta column;
-					column.name = column_json.Require("name", "column").GetString("column.name");
-					auto type_string = column_json.Require("duckdb_type", "column").GetString("column.duckdb_type");
+					column.name = JsonString(JsonRequire(column_json, "name", "column"), "column.name");
+					auto type_string = JsonString(JsonRequire(column_json, "duckdb_type", "column"), "column.duckdb_type");
 					column.type = ParseAdapterType(context, type_string);
-					column.nullable = column_json.Require("nullable", "column").GetBoolean("column.nullable");
+					column.nullable = JsonBoolean(JsonRequire(column_json, "nullable", "column"), "column.nullable");
 					table.columns.push_back(std::move(column));
 				}
-				if (auto primary_key = table_json.Get("primary_key")) {
-					for (auto &key_json : primary_key->GetArray("table.primary_key")) {
-						table.primary_key.push_back(key_json.GetString("primary_key column"));
+				if (auto primary_key = JsonGet(table_json, "primary_key")) {
+					auto primary_key_array = JsonArray(primary_key, "table.primary_key");
+					size_t key_idx, key_max;
+					yyjson_val *key_json;
+					yyjson_arr_foreach(primary_key_array, key_idx, key_max, key_json) {
+						table.primary_key.push_back(JsonString(key_json, "primary_key column"));
 					}
 				}
 				snapshot.tables.push_back(std::move(table));
@@ -1183,37 +989,38 @@ static void ValidateCreateTable(const CreateTableInfo &base) {
 	}
 }
 
-static JsonValue CreateTableOpToJson(const string &catalog_name, BoundCreateTableInfo &info) {
+static yyjson_mut_val *CreateTableOpToJson(JsonWriteDocument &doc, const string &catalog_name,
+                                           BoundCreateTableInfo &info) {
 	auto &base = info.Base();
 	ValidateCreateTable(base);
-	vector<JsonValue> columns;
+	auto columns = doc.Array();
 	idx_t column_idx = 0;
 	for (auto &column : base.columns.Logical()) {
-		columns.push_back(JsonValue::Object({
-		    {"name", JsonValue::String(column.Name())},
-		    {"duckdb_type", JsonValue::String(column.Type().ToString())},
-		    {"nullable", JsonValue::Boolean(ColumnIsNullable(base, column_idx))},
-		    {"default", JsonValue::Null()},
-		    {"generated", JsonValue::Boolean(false)},
-		}));
+		auto column_json = doc.Object();
+		JsonAdd(doc, column_json, "name", doc.String(column.Name()));
+		JsonAdd(doc, column_json, "duckdb_type", doc.String(column.Type().ToString()));
+		JsonAdd(doc, column_json, "nullable", doc.Bool(ColumnIsNullable(base, column_idx)));
+		JsonAdd(doc, column_json, "default", doc.Null());
+		JsonAdd(doc, column_json, "generated", doc.Bool(false));
+		JsonAppend(columns, column_json);
 		column_idx++;
 	}
-	vector<JsonValue> primary_key;
+	auto primary_key = doc.Array();
 	for (auto &column : ExtractPrimaryKey(base)) {
-		primary_key.push_back(JsonValue::String(column));
+		JsonAppend(primary_key, doc.String(column));
 	}
-	return JsonValue::Object({
-	    {"op", JsonValue::String("create_table")},
-	    {"catalog", JsonValue::String(catalog_name)},
-	    {"schema", JsonValue::String(base.schema)},
-	    {"table", JsonValue::String(base.table)},
-	    {"on_conflict", JsonValue::String("error")},
-	    {"columns", JsonValue::Array(std::move(columns))},
-	    {"primary_key", JsonValue::Array(std::move(primary_key))},
-	    {"unique", JsonValue::Array({})},
-	    {"checks", JsonValue::Array({})},
-	    {"foreign_keys", JsonValue::Array({})},
-	});
+	auto result = doc.Object();
+	JsonAdd(doc, result, "op", doc.String("create_table"));
+	JsonAdd(doc, result, "catalog", doc.String(catalog_name));
+	JsonAdd(doc, result, "schema", doc.String(base.schema));
+	JsonAdd(doc, result, "table", doc.String(base.table));
+	JsonAdd(doc, result, "on_conflict", doc.String("error"));
+	JsonAdd(doc, result, "columns", columns);
+	JsonAdd(doc, result, "primary_key", primary_key);
+	JsonAdd(doc, result, "unique", doc.Array());
+	JsonAdd(doc, result, "checks", doc.Array());
+	JsonAdd(doc, result, "foreign_keys", doc.Array());
+	return result;
 }
 
 optional_ptr<CatalogEntry> LlmCatalog::ApplyCreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
@@ -1221,18 +1028,21 @@ optional_ptr<CatalogEntry> LlmCatalog::ApplyCreateTable(CatalogTransaction trans
 		throw InternalException("LLM CREATE TABLE requires a client context");
 	}
 	auto &context = transaction.GetContext();
-	auto op = CreateTableOpToJson(GetName(), info);
-	auto response = client.Post(context, "/v1/mutations/apply",
-	                            JsonValue::Object({
-	                                {"type", JsonValue::String("apply_mutation")},
-	                                {"base_catalog_version", JsonValue::String(catalog_version)},
-	                                {"operations", JsonValue::Array({std::move(op)})},
-	                            }));
-	auto status = response.Require("status", "mutation response").GetString("mutation status");
+	JsonWriteDocument doc;
+	auto op = CreateTableOpToJson(doc, GetName(), info);
+	auto operations = doc.Array();
+	JsonAppend(operations, op);
+	auto request = doc.Object();
+	JsonAdd(doc, request, "type", doc.String("apply_mutation"));
+	JsonAdd(doc, request, "base_catalog_version", doc.String(catalog_version));
+	JsonAdd(doc, request, "operations", operations);
+	auto response = client.Post(context, "/v1/mutations/apply", doc.Write(request));
+	auto root = response->Root();
+	auto status = JsonString(JsonRequire(root, "status", "mutation response"), "mutation status");
 	if (status != "applied") {
 		throw IOException("LLM mutation failed with status \"%s\"", status);
 	}
-	auto snapshot = ParseCatalogSnapshot(context, response.Require("catalog", "mutation response"));
+	auto snapshot = ParseCatalogSnapshot(context, JsonRequire(root, "catalog", "mutation response"));
 	ReplaceCatalog(context, snapshot);
 	return main_schema->LookupEntry(transaction, EntryLookupInfo(CatalogType::TABLE_ENTRY, info.Base().table));
 }
@@ -1259,9 +1069,10 @@ static vector<idx_t> BuildOutputColumnIds(const vector<ColumnIndex> &column_ids,
 	return result;
 }
 
-static JsonValue BuildProjectionJson(const LlmTableEntry &table, const vector<idx_t> &output_column_ids,
-                                     vector<LogicalType> &response_types, vector<LogicalType> &output_types,
-                                     vector<idx_t> &output_to_response) {
+static yyjson_mut_val *BuildProjectionJson(JsonWriteDocument &doc, const LlmTableEntry &table,
+                                           const vector<idx_t> &output_column_ids,
+                                           vector<LogicalType> &response_types, vector<LogicalType> &output_types,
+                                           vector<idx_t> &output_to_response) {
 	auto &meta = table.GetMeta();
 	vector<idx_t> response_column_ids;
 	for (auto column_id : output_column_ids) {
@@ -1275,14 +1086,14 @@ static JsonValue BuildProjectionJson(const LlmTableEntry &table, const vector<id
 	}
 	std::sort(response_column_ids.begin(), response_column_ids.end());
 
-	vector<JsonValue> projections;
+	auto projections = doc.Array();
 	for (auto column_id : response_column_ids) {
 		auto &column = meta.columns[column_id];
 		response_types.push_back(column.type);
-		projections.push_back(JsonValue::Object({
-		    {"name", JsonValue::String(column.name)},
-		    {"duckdb_type", JsonValue::String(column.type.ToString())},
-		}));
+		auto projection = doc.Object();
+		JsonAdd(doc, projection, "name", doc.String(column.name));
+		JsonAdd(doc, projection, "duckdb_type", doc.String(column.type.ToString()));
+		JsonAppend(projections, projection);
 	}
 	for (auto column_id : output_column_ids) {
 		auto entry = std::find(response_column_ids.begin(), response_column_ids.end(), column_id);
@@ -1291,40 +1102,59 @@ static JsonValue BuildProjectionJson(const LlmTableEntry &table, const vector<id
 		}
 		output_to_response.push_back(NumericCast<idx_t>(entry - response_column_ids.begin()));
 	}
-	return JsonValue::Array(std::move(projections));
+	return projections;
 }
 
 static unique_ptr<GlobalTableFunctionState> LlmScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<LlmScanBindData>();
+	if (input.filters && !input.filters->filters.empty()) {
+		throw NotImplementedException(
+		    "LLM adapter cannot apply filters locally; the predicate was not pushed down to Python");
+	}
 	auto result = make_uniq<LlmScanGlobalState>();
 	auto output_column_ids = BuildOutputColumnIds(input.column_indexes, input.projection_ids);
-	auto projection = BuildProjectionJson(bind.table, output_column_ids, result->response_types, result->output_types,
+	JsonWriteDocument doc;
+	auto projection = BuildProjectionJson(doc, bind.table, output_column_ids, result->response_types, result->output_types,
 	                                      result->output_to_response);
-	auto response = bind.catalog.Select(
-	    context, JsonValue::Object({
-	                 {"schema", JsonValue::String(bind.table.GetMeta().schema)},
-	                 {"table", JsonValue::String(bind.table.GetMeta().name)},
-	                 {"projection", std::move(projection)},
-	                 {"predicate", bind.has_predicate ? bind.predicate : JsonValue::Null()},
-	                 {"limit", bind.has_limit ? JsonValue::Number(NumericCast<int64_t>(bind.limit)) : JsonValue::Null()},
-	             }));
-	auto &columns = response.Require("columns", "select response").GetArray("select columns");
-	if (columns.size() != result->response_types.size()) {
-		throw IOException("LLM adapter select returned %llu columns, expected %llu", columns.size(),
+	auto query = doc.Object();
+	JsonAdd(doc, query, "schema", doc.String(bind.table.GetMeta().schema));
+	JsonAdd(doc, query, "table", doc.String(bind.table.GetMeta().name));
+	JsonAdd(doc, query, "projection", projection);
+	JsonAdd(doc, query, "predicate", bind.has_predicate ? doc.ParseAndCopy(bind.predicate_json, "select predicate")
+	                                                    : doc.Null());
+	JsonAdd(doc, query, "limit", bind.has_limit ? doc.Int(NumericCast<int64_t>(bind.limit)) : doc.Null());
+	auto response = bind.catalog.Select(context, doc.Write(query));
+	auto root = response->Root();
+	auto columns = JsonArray(JsonRequire(root, "columns", "select response"), "select columns");
+	if (yyjson_arr_size(columns) != result->response_types.size()) {
+		throw IOException("LLM adapter select returned %llu columns, expected %llu",
+		                  NumericCast<idx_t>(yyjson_arr_size(columns)),
 		                  result->response_types.size());
 	}
-	for (idx_t i = 0; i < columns.size(); i++) {
-		auto returned_type = columns[i].Require("duckdb_type", "select column").GetString("select column type");
-		if (returned_type != result->response_types[i].ToString()) {
+	size_t column_idx, column_max;
+	yyjson_val *column_json;
+	yyjson_arr_foreach(columns, column_idx, column_max, column_json) {
+		auto returned_type = JsonString(JsonRequire(column_json, "duckdb_type", "select column"), "select column type");
+		if (returned_type != result->response_types[column_idx].ToString()) {
 			throw IOException("LLM adapter select returned type \"%s\" for column %llu, expected \"%s\"", returned_type,
-			                  i, result->response_types[i].ToString());
+			                  column_idx, result->response_types[column_idx].ToString());
 		}
 	}
-	for (auto &row : response.Require("rows", "select response").GetArray("select rows")) {
-		if (row.GetArray("select row").size() != result->response_types.size()) {
+	auto rows = JsonArray(JsonRequire(root, "rows", "select response"), "select rows");
+	size_t row_idx, row_max;
+	yyjson_val *row_json;
+	yyjson_arr_foreach(rows, row_idx, row_max, row_json) {
+		auto row_array = JsonArray(row_json, "select row");
+		if (yyjson_arr_size(row_array) != result->response_types.size()) {
 			throw IOException("LLM adapter select returned a row with the wrong width");
 		}
-		result->rows.push_back(row);
+		vector<Value> row_values;
+		size_t value_idx, value_max;
+		yyjson_val *value_json;
+		yyjson_arr_foreach(row_array, value_idx, value_max, value_json) {
+			row_values.push_back(JsonToValue(value_json, result->response_types[value_idx], "select row value"));
+		}
+		result->rows.push_back(std::move(row_values));
 	}
 	return std::move(result);
 }
@@ -1337,11 +1167,10 @@ static void LlmScanFunction(ClientContext &, TableFunctionInput &data, DataChunk
 	auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.rows.size() - state.offset);
 	output.SetCardinality(count);
 	for (idx_t row_idx = 0; row_idx < count; row_idx++) {
-		auto &row = state.rows[state.offset + row_idx].GetArray("select row");
+		auto &row = state.rows[state.offset + row_idx];
 		for (idx_t col_idx = 0; col_idx < state.output_types.size(); col_idx++) {
 			auto response_col_idx = state.output_to_response[col_idx];
-			output.SetValue(col_idx, row_idx,
-			                JsonToValue(row[response_col_idx], state.output_types[col_idx], "select row value"));
+			output.SetValue(col_idx, row_idx, row[response_col_idx]);
 		}
 	}
 	state.offset += count;
@@ -1353,16 +1182,21 @@ static void LlmPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionD
 		return;
 	}
 	auto &bind = bind_data->Cast<LlmScanBindData>();
-	vector<JsonValue> predicates;
+	JsonWriteDocument doc;
+	auto predicates = doc.Array();
 	for (auto &filter : filters) {
-		predicates.push_back(ExpressionToPredicate(get, *filter));
+		JsonAppend(predicates, ExpressionToPredicate(doc, get, *filter));
 	}
 	bind.has_predicate = true;
-	bind.predicate = predicates.size() == 1 ? std::move(predicates[0])
-	                                        : JsonValue::Object({
-	                                              {"kind", JsonValue::String("and")},
-	                                              {"children", JsonValue::Array(std::move(predicates))},
-	                                          });
+	yyjson_mut_val *predicate = nullptr;
+	if (yyjson_mut_arr_size(predicates) == 1) {
+		predicate = yyjson_mut_arr_get(predicates, 0);
+	} else {
+		predicate = doc.Object();
+		JsonAdd(doc, predicate, "kind", doc.String("and"));
+		JsonAdd(doc, predicate, "children", predicates);
+	}
+	bind.predicate_json = doc.Write(predicate);
 	filters.clear();
 }
 
@@ -1431,8 +1265,18 @@ private:
 		}
 		return changed;
 	}
+	static void RejectLocalFilters(LogicalOperator &op) {
+		if (op.type == LogicalOperatorType::LOGICAL_FILTER && !op.children.empty() && CountLlmGets(*op.children[0]) > 0) {
+			throw NotImplementedException(
+			    "LLM adapter cannot apply filters locally; the predicate was not pushed down to Python");
+		}
+		for (auto &child : op.children) {
+			RejectLocalFilters(*child);
+		}
+	}
 	static void Optimize(OptimizerExtensionInput &, unique_ptr<LogicalOperator> &plan) {
 		TryPushLimit(plan);
+		RejectLocalFilters(*plan);
 	}
 };
 
