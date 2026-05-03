@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, Protocol, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -63,13 +63,20 @@ class CreateTableOp(AdapterModel):
     foreign_keys: list[JsonObject] = Field(default_factory=list)
 
 
-MutationOp: TypeAlias = CreateTableOp
+class InsertColumn(AdapterModel):
+    name: str
+    duckdb_type: str
+    nullable: bool = True
 
 
-class ApplyMutationRequest(AdapterModel):
-    type: Literal["apply_mutation"]
-    base_catalog_version: str
-    operations: list[MutationOp]
+class InsertRowsOp(AdapterModel):
+    op: Literal["insert_rows"]
+    catalog: str
+    schema_: str = Field(alias="schema")
+    table: str
+    columns: list[InsertColumn]
+    primary_key: list[str] = Field(default_factory=list)
+    rows: list[list[JsonScalar]]
 
 
 class AdapterError(AdapterModel):
@@ -116,6 +123,13 @@ class ArithmeticPredicate(AdapterModel):
     args: list[Predicate]
 
 
+class FunctionPredicate(AdapterModel):
+    kind: Literal["function"]
+    name: str
+    duckdb_type: str
+    args: list[Predicate]
+
+
 class BooleanPredicate(AdapterModel):
     kind: Literal["and", "or"]
     children: list[Predicate]
@@ -131,15 +145,44 @@ Predicate: TypeAlias = Annotated[
     | LiteralPredicate
     | ComparisonPredicate
     | ArithmeticPredicate
+    | FunctionPredicate
     | BooleanPredicate
     | NullPredicate,
     Field(discriminator="kind"),
 ]
 
 
+class UpdateAssignment(AdapterModel):
+    column: str
+    duckdb_type: str
+    value: Predicate
+
+
+class UpdateRowsOp(AdapterModel):
+    op: Literal["update_rows"]
+    catalog: str
+    schema_: str = Field(alias="schema")
+    table: str
+    columns: list[InsertColumn] = Field(default_factory=list)
+    primary_key: list[str] = Field(default_factory=list)
+    assignments: list[UpdateAssignment]
+    predicate: Predicate | None = None
+
+
+MutationOp: TypeAlias = Annotated[CreateTableOp | InsertRowsOp | UpdateRowsOp, Field(discriminator="op")]
+
+
+class ApplyMutationRequest(AdapterModel):
+    type: Literal["apply_mutation"]
+    base_catalog_version: str
+    operations: list[MutationOp]
+
+
 class SelectQuery(AdapterModel):
     schema_: str = Field(alias="schema")
     table: str
+    columns: list[InsertColumn] = Field(default_factory=list)
+    primary_key: list[str] = Field(default_factory=list)
     projection: list[SelectColumn]
     predicate: Predicate | None = None
     limit: int | None = None
@@ -154,14 +197,3 @@ class SelectRequest(AdapterModel):
 class SelectResponse(AdapterModel):
     columns: list[SelectColumn]
     rows: list[list[JsonScalar]]
-
-
-class Pipeline(Protocol):
-    def introspect_catalog(self, request: CatalogIntrospectRequest) -> CatalogSnapshot:
-        ...
-
-    def apply_mutation(self, request: ApplyMutationRequest) -> MutationResponse:
-        ...
-
-    def sample_select(self, request: SelectRequest) -> SelectResponse:
-        ...

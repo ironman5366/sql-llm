@@ -22,3 +22,5 @@ Goals:
 Non-Goals:
 
 - Any practical engineering value or utility.
+
+Current runnable kernel notes and demo commands live in `docs/db_kernel.md`.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 from fastapi import FastAPI, HTTPException
 
 from .adapter_protocol import (
@@ -7,33 +9,36 @@ from .adapter_protocol import (
     CatalogIntrospectRequest,
     CatalogSnapshot,
     MutationResponse,
-    Pipeline,
     SelectRequest,
     SelectResponse,
 )
+from .database import LLMDatabase
 
 
-def create_app(pipeline: Pipeline) -> FastAPI:
+def create_app(database: LLMDatabase) -> FastAPI:
     app = FastAPI(title="sql-llm adapter")
 
     @app.post("/v1/catalog/introspect", response_model=CatalogSnapshot)
-    def introspect_catalog(request: CatalogIntrospectRequest) -> CatalogSnapshot:
-        return _call_pipeline(lambda: pipeline.introspect_catalog(request))
+    async def introspect_catalog(request: CatalogIntrospectRequest) -> CatalogSnapshot:
+        return await _call_pipeline(lambda: database.introspect_catalog(request))
 
     @app.post("/v1/mutations/apply", response_model=MutationResponse)
-    def apply_mutation(request: ApplyMutationRequest) -> MutationResponse:
-        return _call_pipeline(lambda: pipeline.apply_mutation(request))
+    async def apply_mutation(request: ApplyMutationRequest) -> MutationResponse:
+        return await _call_pipeline(lambda: database.apply_mutation(request))
 
     @app.post("/v1/query/select", response_model=SelectResponse)
-    def select(request: SelectRequest) -> SelectResponse:
-        return _call_pipeline(lambda: pipeline.sample_select(request))
+    async def select(request: SelectRequest) -> SelectResponse:
+        return await _call_pipeline(lambda: database.sample_select(request))
 
     return app
 
 
-def _call_pipeline(call):
+async def _call_pipeline(call):
     try:
-        return call()
+        result = call()
+        if inspect.isawaitable(result):
+            result = await result
+        return result
     except NotImplementedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except ValueError as exc:

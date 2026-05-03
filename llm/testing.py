@@ -10,10 +10,12 @@ from .adapter_protocol import (
     CatalogSnapshot,
     CatalogTable,
     CreateTableOp,
+    InsertRowsOp,
     MutationResponse,
     SelectColumn,
     SelectRequest,
     SelectResponse,
+    UpdateRowsOp,
 )
 
 
@@ -51,6 +53,8 @@ class RecordingPipeline:
         for operation in request.operations:
             if isinstance(operation, CreateTableOp):
                 _apply_create_table(next_catalog, operation)
+            elif isinstance(operation, InsertRowsOp | UpdateRowsOp):
+                pass
             else:  # pragma: no cover - protected by the protocol model today
                 raise ValueError(f"unsupported fake mutation operation: {operation!r}")
 
