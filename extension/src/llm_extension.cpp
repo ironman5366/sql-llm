@@ -57,6 +57,7 @@
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
+#include "duckdb/common/progress_bar/display/terminal_progress_bar_display.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
@@ -590,18 +591,14 @@ private:
 		if (printed && percent == last_percent && phase == last_phase && message == last_message) {
 			return;
 		}
-		constexpr int32_t width = 28;
-		auto filled = NumericCast<int32_t>((static_cast<int64_t>(percent) * width) / 100);
-		string bar;
-		bar.reserve(width);
-		for (int32_t i = 0; i < width; i++) {
-			bar.push_back(i < filled ? '#' : '.');
-		}
+		ProgressBarDisplayInfo display_info;
+		display_info.width = 28;
+		auto bar = TerminalProgressBarDisplay::FormatProgressBar(display_info, percent);
 		auto shown_phase = phase.empty() ? "working" : phase;
 		auto shown_message = message.size() > 72 ? message.substr(0, 72) : message;
 		// \033[K clears from the cursor to the end of the line so a short message after
 		// a long one does not leave stale characters.
-		std::fprintf(stderr, "\rLLM mutation %-10s [%s] %3d%% %s\033[K", shown_phase.c_str(), bar.c_str(), percent,
+		std::fprintf(stderr, "\rLLM mutation %-10s %s %3d%% %s\033[K", shown_phase.c_str(), bar.c_str(), percent,
 		             shown_message.c_str());
 		std::fflush(stderr);
 		printed = true;
