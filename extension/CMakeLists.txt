@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
+include_directories(duckdb/third_party/httplib)
 
 set(EXTENSION_SOURCES src/llm_extension.cpp)
 

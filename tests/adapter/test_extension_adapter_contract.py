@@ -124,6 +124,11 @@ def test_arithmetic_predicate_is_pushed_to_adapter(mock_llm_server, built_extens
                 "query": {
                     "schema": "main",
                     "table": "fruits",
+                    "columns": [
+                        {"name": "name", "duckdb_type": "VARCHAR", "nullable": False},
+                        {"name": "goodness", "duckdb_type": "INTEGER", "nullable": True},
+                    ],
+                    "primary_key": ["name"],
                     "projection": [
                         {"name": "name", "duckdb_type": "VARCHAR"},
                         {"name": "goodness", "duckdb_type": "INTEGER"},
@@ -159,6 +164,104 @@ def test_arithmetic_predicate_is_pushed_to_adapter(mock_llm_server, built_extens
             },
         },
     ]
+
+
+def test_insert_rows_are_sent_to_adapter(mock_llm_server, built_extension_path):
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.execute(f"LOAD '{built_extension_path.as_posix()}'")
+    con.execute(
+        f"""
+        ATTACH '' AS llm (
+            TYPE llm,
+            endpoint '{mock_llm_server.url}'
+        )
+        """
+    )
+    con.execute("CREATE TABLE llm.fruits (name TEXT PRIMARY KEY, goodness INT)")
+
+    inserted = con.execute(
+        """
+        INSERT INTO llm.fruits (name, goodness)
+        VALUES ('apple', 1), ('orange', 2)
+        """
+    ).fetchall()
+
+    assert inserted == [(2,)]
+    assert mock_llm_server.calls[-1] == {
+        "path": "/v1/mutations/apply",
+        "json": {
+            "type": "apply_mutation",
+            "base_catalog_version": "v1",
+            "operations": [
+                {
+                    "op": "insert_rows",
+                    "catalog": "llm",
+                    "schema": "main",
+                    "table": "fruits",
+                    "columns": [
+                        {"name": "name", "duckdb_type": "VARCHAR", "nullable": False},
+                        {"name": "goodness", "duckdb_type": "INTEGER", "nullable": True},
+                    ],
+                    "primary_key": ["name"],
+                    "rows": [["apple", 1], ["orange", 2]],
+                }
+            ],
+        },
+    }
+
+
+def test_update_is_sent_to_adapter_as_typed_expression(mock_llm_server, built_extension_path):
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.execute(f"LOAD '{built_extension_path.as_posix()}'")
+    con.execute(
+        f"""
+        ATTACH '' AS llm (
+            TYPE llm,
+            endpoint '{mock_llm_server.url}'
+        )
+        """
+    )
+    con.execute("CREATE TABLE llm.fruits (name TEXT PRIMARY KEY, goodness INT)")
+
+    con.execute(
+        """
+        UPDATE llm.fruits
+        SET goodness = goodness * 2
+        WHERE starts_with(name, 'ap')
+        """
+    ).fetchall()
+
+    update_call = mock_llm_server.calls[-1]
+    assert update_call["path"] == "/v1/mutations/apply"
+    update_op = update_call["json"]["operations"][0]
+    assert update_op["op"] == "update_rows"
+    assert update_op["catalog"] == "llm"
+    assert update_op["schema"] == "main"
+    assert update_op["table"] == "fruits"
+    assert update_op["columns"] == [
+        {"name": "name", "duckdb_type": "VARCHAR", "nullable": False},
+        {"name": "goodness", "duckdb_type": "INTEGER", "nullable": True},
+    ]
+    assert update_op["primary_key"] == ["name"]
+    assert update_op["assignments"] == [
+        {
+            "column": "goodness",
+            "duckdb_type": "INTEGER",
+            "value": {
+                "kind": "arithmetic",
+                "op": "*",
+                "duckdb_type": "INTEGER",
+                "args": [
+                    {"kind": "column", "name": "goodness", "duckdb_type": "INTEGER"},
+                    {"kind": "literal", "value": 2, "duckdb_type": "INTEGER"},
+                ],
+            },
+        }
+    ]
+    assert update_op["predicate"]["kind"] == "function"
+    assert update_op["predicate"]["name"] in {"starts_with", "prefix"}
+    assert update_op["predicate"]["args"][0] == {"kind": "column", "name": "name", "duckdb_type": "VARCHAR"}
+    assert update_op["predicate"]["args"][1] == {"kind": "literal", "value": "ap", "duckdb_type": "VARCHAR"}
 
 
 def test_unsupported_predicate_fails_before_select(mock_llm_server, built_extension_path):
@@ -280,6 +383,11 @@ def _expected_calls():
                 "query": {
                     "schema": "main",
                     "table": "fruits",
+                    "columns": [
+                        {"name": "name", "duckdb_type": "VARCHAR", "nullable": False},
+                        {"name": "goodness", "duckdb_type": "INTEGER", "nullable": True},
+                    ],
+                    "primary_key": ["name"],
                     "projection": [
                         {"name": "name", "duckdb_type": "VARCHAR"},
                         {"name": "goodness", "duckdb_type": "INTEGER"},

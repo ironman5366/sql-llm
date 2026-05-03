@@ -43,11 +43,14 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -286,6 +289,26 @@ static yyjson_mut_val *ColumnReferenceToJson(yyjson_mut_doc *doc, const LogicalG
 	return result;
 }
 
+static yyjson_mut_val *BoundReferenceToJson(yyjson_mut_doc *doc, const LogicalGet &get,
+                                            const BoundReferenceExpression &ref) {
+	auto binding_index = NumericCast<idx_t>(ref.index);
+	auto &column_ids = get.GetColumnIds();
+	if (binding_index >= column_ids.size()) {
+		throw NotImplementedException("LLM adapter cannot map update expression reference \"%s\"", ref.ToString());
+	}
+	auto column_index = column_ids[binding_index].GetPrimaryIndex();
+	if (column_index >= get.names.size()) {
+		throw NotImplementedException("LLM adapter cannot push down virtual column reference");
+	}
+	auto result = yyjson_mut_obj(doc);
+	auto &name = get.names[column_index];
+	auto type_string = get.returned_types[column_index].ToString();
+	yyjson_mut_obj_add_str(doc, result, "kind", "column");
+	yyjson_mut_obj_add_strncpy(doc, result, "name", name.c_str(), name.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "duckdb_type", type_string.c_str(), type_string.size());
+	return result;
+}
+
 static yyjson_mut_val *LiteralToJson(yyjson_mut_doc *doc, const BoundConstantExpression &constant) {
 	auto result = yyjson_mut_obj(doc);
 	auto type_string = constant.value.type().ToString();
@@ -311,6 +334,12 @@ static string ComparisonOperatorToString(ExpressionType type) {
 
 static bool IsSupportedArithmeticFunction(const string &name) {
 	return name == "+" || name == "-" || name == "*" || name == "/" || name == "//" || name == "%";
+}
+
+static bool IsSupportedPredicateFunction(const string &name) {
+	auto lower_name = StringUtil::Lower(name);
+	return lower_name == "starts_with" || lower_name == "prefix" || lower_name == "contains" ||
+	       lower_name == "contains_substr" || lower_name == "like" || lower_name == "~~";
 }
 
 static yyjson_mut_val *ExpressionToPredicate(yyjson_mut_doc *doc, const LogicalGet &get, const Expression &expr);
@@ -341,10 +370,30 @@ static yyjson_mut_val *ArithmeticFunctionToJson(yyjson_mut_doc *doc, const Logic
 	return result;
 }
 
+static yyjson_mut_val *ScalarFunctionToPredicateJson(yyjson_mut_doc *doc, const LogicalGet &get,
+                                                     const BoundFunctionExpression &function) {
+	if (!IsSupportedPredicateFunction(function.function.name)) {
+		throw NotImplementedException("LLM adapter cannot push down scalar function \"%s\" yet", function.function.name);
+	}
+	auto args = yyjson_mut_arr(doc);
+	for (auto &child : function.children) {
+		yyjson_mut_arr_add_val(args, ExpressionToPredicate(doc, get, *child));
+	}
+	auto result = yyjson_mut_obj(doc);
+	auto return_type = function.return_type.ToString();
+	yyjson_mut_obj_add_str(doc, result, "kind", "function");
+	yyjson_mut_obj_add_strncpy(doc, result, "name", function.function.name.c_str(), function.function.name.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "duckdb_type", return_type.c_str(), return_type.size());
+	yyjson_mut_obj_add_val(doc, result, "args", args);
+	return result;
+}
+
 static yyjson_mut_val *ExpressionToPredicate(yyjson_mut_doc *doc, const LogicalGet &get, const Expression &expr) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF:
 		return ColumnReferenceToJson(doc, get, expr.Cast<BoundColumnRefExpression>());
+	case ExpressionClass::BOUND_REF:
+		return BoundReferenceToJson(doc, get, expr.Cast<BoundReferenceExpression>());
 	case ExpressionClass::BOUND_CONSTANT:
 		return LiteralToJson(doc, expr.Cast<BoundConstantExpression>());
 	case ExpressionClass::BOUND_CAST: {
@@ -376,8 +425,13 @@ static yyjson_mut_val *ExpressionToPredicate(yyjson_mut_doc *doc, const LogicalG
 		yyjson_mut_obj_add_val(doc, result, "children", children);
 		return result;
 	}
-	case ExpressionClass::BOUND_FUNCTION:
-		return ArithmeticFunctionToJson(doc, get, expr.Cast<BoundFunctionExpression>());
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		if (IsSupportedArithmeticFunction(function.function.name)) {
+			return ArithmeticFunctionToJson(doc, get, function);
+		}
+		return ScalarFunctionToPredicateJson(doc, get, function);
+	}
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
 		if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
@@ -442,6 +496,8 @@ struct LlmScanBindData : public FunctionData {
 		return false;
 	}
 };
+
+static BindInfo LlmScanBindInfo(const optional_ptr<FunctionData> bind_data);
 
 struct LlmScanGlobalState : public GlobalTableFunctionState {
 	vector<vector<Value>> rows;
@@ -536,6 +592,11 @@ private:
 	LlmCatalog &llm_catalog;
 	LlmTableMeta meta;
 };
+
+static BindInfo LlmScanBindInfo(const optional_ptr<FunctionData> bind_data) {
+	auto &bind = bind_data->Cast<LlmScanBindData>();
+	return BindInfo(static_cast<TableCatalogEntry &>(bind.table));
+}
 
 class LlmSchemaEntry : public SchemaCatalogEntry {
 public:
@@ -643,17 +704,14 @@ public:
 		throw NotImplementedException("LLM CREATE TABLE AS is not implemented in the adapter protocol yet");
 	}
 	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
-	                             optional_ptr<PhysicalOperator> plan) override {
-		throw NotImplementedException("LLM INSERT is not implemented in the adapter protocol yet");
-	}
+	                             optional_ptr<PhysicalOperator> plan) override;
 	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
 	                             PhysicalOperator &plan) override {
 		throw NotImplementedException("LLM DELETE is not implemented in the adapter protocol yet");
 	}
+	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op) override;
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
-	                             PhysicalOperator &plan) override {
-		throw NotImplementedException("LLM UPDATE is not implemented in the adapter protocol yet");
-	}
+	                             PhysicalOperator &plan) override;
 	DatabaseSize GetDatabaseSize(ClientContext &context) override {
 		return DatabaseSize();
 	}
@@ -698,6 +756,11 @@ public:
 		main_schema->ReplaceTables(context, snapshot.tables);
 	}
 	optional_ptr<CatalogEntry> ApplyCreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info);
+	struct MutationResult {
+		LlmCatalogSnapshot snapshot;
+		idx_t affected_rows = 0;
+	};
+	MutationResult ApplyMutation(ClientContext &context, yyjson_mut_doc *doc, yyjson_mut_val *operations);
 	string Select(ClientContext &context, const string &query_json) {
 		auto doc = yyjson_mut_doc_new(nullptr);
 		if (!doc) {
@@ -812,6 +875,128 @@ private:
 	LlmAdapterClient client;
 	string catalog_version;
 	unique_ptr<LlmSchemaEntry> main_schema;
+};
+
+static yyjson_mut_val *InsertRowsOpToJson(yyjson_mut_doc *doc, const string &catalog_name, const LlmTableEntry &table,
+                                          const vector<vector<Value>> &rows);
+
+class LlmInsertGlobalState : public GlobalSinkState {
+public:
+	mutex lock;
+	vector<vector<Value>> rows;
+	idx_t inserted_rows = 0;
+};
+
+class LlmInsertSourceState : public GlobalSourceState {
+public:
+	bool emitted = false;
+};
+
+class LlmPhysicalInsert : public PhysicalOperator {
+public:
+	LlmPhysicalInsert(PhysicalPlan &physical_plan, vector<LogicalType> types, LlmCatalog &catalog_p,
+	                  LlmTableEntry &table_p, idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::INSERT, std::move(types), estimated_cardinality),
+	      catalog(catalog_p), table(table_p) {
+	}
+
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
+		return make_uniq<LlmInsertGlobalState>();
+	}
+	SinkResultType Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &state = input.global_state.Cast<LlmInsertGlobalState>();
+		chunk.Flatten();
+		lock_guard<mutex> guard(state.lock);
+		for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
+			vector<Value> row;
+			for (idx_t column_idx = 0; column_idx < chunk.ColumnCount(); column_idx++) {
+				row.push_back(chunk.GetValue(column_idx, row_idx));
+			}
+			state.rows.push_back(std::move(row));
+		}
+		state.inserted_rows += chunk.size();
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context, OperatorSinkFinalizeInput &input) const override {
+		auto &state = input.global_state.Cast<LlmInsertGlobalState>();
+		auto doc = yyjson_mut_doc_new(nullptr);
+		if (!doc) {
+			throw InternalException("Failed to allocate LLM adapter JSON document");
+		}
+		auto operations = yyjson_mut_arr(doc);
+		yyjson_mut_arr_add_val(operations, InsertRowsOpToJson(doc, catalog.GetName(), table, state.rows));
+		catalog.ApplyMutation(context, doc, operations);
+		return SinkFinalizeType::READY;
+	}
+	bool IsSink() const override {
+		return true;
+	}
+	bool SinkOrderDependent() const override {
+		return true;
+	}
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
+		return make_uniq<LlmInsertSourceState>();
+	}
+	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
+		auto &source_state = input.global_state.Cast<LlmInsertSourceState>();
+		if (source_state.emitted) {
+			return SourceResultType::FINISHED;
+		}
+		auto &sink = sink_state->Cast<LlmInsertGlobalState>();
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(sink.inserted_rows)));
+		source_state.emitted = true;
+		return SourceResultType::FINISHED;
+	}
+	bool IsSource() const override {
+		return true;
+	}
+
+private:
+	LlmCatalog &catalog;
+	LlmTableEntry &table;
+};
+
+class LlmUpdateSourceState : public GlobalSourceState {
+public:
+	bool emitted = false;
+};
+
+class LlmPhysicalUpdate : public PhysicalOperator {
+public:
+	LlmPhysicalUpdate(PhysicalPlan &physical_plan, vector<LogicalType> types, LlmCatalog &catalog_p,
+	                  string operation_json_p, idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::UPDATE, std::move(types), estimated_cardinality),
+	      catalog(catalog_p), operation_json(std::move(operation_json_p)) {
+	}
+
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
+		return make_uniq<LlmUpdateSourceState>();
+	}
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override {
+		auto &source_state = input.global_state.Cast<LlmUpdateSourceState>();
+		if (source_state.emitted) {
+			return SourceResultType::FINISHED;
+		}
+		auto doc = yyjson_mut_doc_new(nullptr);
+		if (!doc) {
+			throw InternalException("Failed to allocate LLM adapter JSON document");
+		}
+		auto operations = yyjson_mut_arr(doc);
+		yyjson_mut_arr_add_val(operations, yyjson_mut_rawncpy(doc, operation_json.c_str(), operation_json.size()));
+		auto result = catalog.ApplyMutation(context.client, doc, operations);
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(result.affected_rows)));
+		source_state.emitted = true;
+		return SourceResultType::FINISHED;
+	}
+	bool IsSource() const override {
+		return true;
+	}
+
+private:
+	LlmCatalog &catalog;
+	string operation_json;
 };
 
 LlmTableEntry::LlmTableEntry(LlmCatalog &llm_catalog_p, SchemaCatalogEntry &schema, CreateTableInfo &info,
@@ -969,18 +1154,168 @@ static yyjson_mut_val *CreateTableOpToJson(yyjson_mut_doc *doc, const string &ca
 	return result;
 }
 
-optional_ptr<CatalogEntry> LlmCatalog::ApplyCreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
-	if (!transaction.HasContext()) {
-		throw InternalException("LLM CREATE TABLE requires a client context");
+static yyjson_mut_val *MutationColumnToJson(yyjson_mut_doc *doc, const LlmColumnMeta &column) {
+	auto column_json = yyjson_mut_obj(doc);
+	auto column_type = column.type.ToString();
+	yyjson_mut_obj_add_strncpy(doc, column_json, "name", column.name.c_str(), column.name.size());
+	yyjson_mut_obj_add_strncpy(doc, column_json, "duckdb_type", column_type.c_str(), column_type.size());
+	yyjson_mut_obj_add_bool(doc, column_json, "nullable", column.nullable);
+	return column_json;
+}
+
+static yyjson_mut_val *PrimaryKeyToJson(yyjson_mut_doc *doc, const vector<string> &primary_key_columns) {
+	auto primary_key = yyjson_mut_arr(doc);
+	for (auto &column : primary_key_columns) {
+		yyjson_mut_arr_add_val(primary_key, yyjson_mut_strncpy(doc, column.c_str(), column.size()));
 	}
-	auto &context = transaction.GetContext();
+	return primary_key;
+}
+
+static yyjson_mut_val *InsertRowsOpToJson(yyjson_mut_doc *doc, const string &catalog_name, const LlmTableEntry &table,
+                                          const vector<vector<Value>> &rows) {
+	auto &meta = table.GetMeta();
+	auto columns = yyjson_mut_arr(doc);
+	for (auto &column : meta.columns) {
+		yyjson_mut_arr_add_val(columns, MutationColumnToJson(doc, column));
+	}
+	auto rows_json = yyjson_mut_arr(doc);
+	for (auto &row : rows) {
+		if (row.size() != meta.columns.size()) {
+			throw InternalException("LLM insert row width does not match table width");
+		}
+		auto row_json = yyjson_mut_arr(doc);
+		for (idx_t column_idx = 0; column_idx < row.size(); column_idx++) {
+			yyjson_mut_arr_add_val(row_json, DuckValueToYyjsonLiteral(doc, row[column_idx]));
+		}
+		yyjson_mut_arr_add_val(rows_json, row_json);
+	}
+	auto result = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_str(doc, result, "op", "insert_rows");
+	yyjson_mut_obj_add_strncpy(doc, result, "catalog", catalog_name.c_str(), catalog_name.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "schema", meta.schema.c_str(), meta.schema.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "table", meta.name.c_str(), meta.name.size());
+	yyjson_mut_obj_add_val(doc, result, "columns", columns);
+	yyjson_mut_obj_add_val(doc, result, "primary_key", PrimaryKeyToJson(doc, meta.primary_key));
+	yyjson_mut_obj_add_val(doc, result, "rows", rows_json);
+	return result;
+}
+
+static void FindSingleLogicalGetRecursive(LogicalOperator &node, optional_ptr<LogicalGet> &result) {
+	if (node.type == LogicalOperatorType::LOGICAL_GET) {
+		if (result) {
+			throw NotImplementedException("LLM UPDATE only supports a single target table scan");
+		}
+		result = &node.Cast<LogicalGet>();
+	}
+	for (auto &child : node.children) {
+		FindSingleLogicalGetRecursive(*child, result);
+	}
+}
+
+static optional_ptr<LogicalGet> FindSingleLogicalGet(LogicalOperator &op) {
+	optional_ptr<LogicalGet> result;
+	FindSingleLogicalGetRecursive(op, result);
+	return result;
+}
+
+static void CollectFilterExpressions(LogicalOperator &op, vector<reference<Expression>> &filters) {
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &filter = op.Cast<LogicalFilter>();
+		for (auto &expr : filter.expressions) {
+			filters.push_back(*expr);
+		}
+	}
+	for (auto &child : op.children) {
+		CollectFilterExpressions(*child, filters);
+	}
+}
+
+static yyjson_mut_val *BuildUpdatePredicateJson(yyjson_mut_doc *doc, const LogicalGet &get, LogicalOperator &root) {
+	vector<reference<Expression>> filters;
+	CollectFilterExpressions(root, filters);
+	if (filters.empty()) {
+		if (get.bind_data) {
+			auto &bind = get.bind_data->Cast<LlmScanBindData>();
+			if (bind.has_predicate) {
+				return yyjson_mut_rawncpy(doc, bind.predicate_json.c_str(), bind.predicate_json.size());
+			}
+		}
+		return yyjson_mut_null(doc);
+	}
+	if (filters.size() == 1) {
+		return ExpressionToPredicate(doc, get, filters[0].get());
+	}
+	auto children = yyjson_mut_arr(doc);
+	for (auto &filter : filters) {
+		yyjson_mut_arr_add_val(children, ExpressionToPredicate(doc, get, filter.get()));
+	}
+	auto result = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_str(doc, result, "kind", "and");
+	yyjson_mut_obj_add_val(doc, result, "children", children);
+	return result;
+}
+
+static const LogicalProjection &UpdateProjection(LogicalUpdate &op) {
+	if (op.children.empty() || op.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+		throw NotImplementedException("LLM UPDATE only supports direct update projections");
+	}
+	return op.children[0]->Cast<LogicalProjection>();
+}
+
+static yyjson_mut_val *UpdateRowsOpToJson(yyjson_mut_doc *doc, const string &catalog_name, const LlmTableEntry &table,
+                                          LogicalUpdate &op) {
+	auto &meta = table.GetMeta();
+	auto columns = yyjson_mut_arr(doc);
+	for (auto &column : meta.columns) {
+		yyjson_mut_arr_add_val(columns, MutationColumnToJson(doc, column));
+	}
+	auto logical_get = FindSingleLogicalGet(*op.children[0]);
+	if (!logical_get) {
+		throw NotImplementedException("LLM UPDATE could not find the target table scan");
+	}
+	auto &projection = UpdateProjection(op);
+	if (projection.expressions.size() < op.columns.size()) {
+		throw InternalException("LLM UPDATE projection does not contain all assignment expressions");
+	}
+	auto assignments = yyjson_mut_arr(doc);
+	for (idx_t assignment_idx = 0; assignment_idx < op.columns.size(); assignment_idx++) {
+		auto column_idx = op.columns[assignment_idx].index;
+		if (column_idx >= meta.columns.size()) {
+			throw NotImplementedException("LLM UPDATE cannot update virtual columns");
+		}
+		auto &column = meta.columns[column_idx];
+		auto assignment = yyjson_mut_obj(doc);
+		auto column_type = column.type.ToString();
+		yyjson_mut_obj_add_strncpy(doc, assignment, "column", column.name.c_str(), column.name.size());
+		yyjson_mut_obj_add_strncpy(doc, assignment, "duckdb_type", column_type.c_str(), column_type.size());
+		yyjson_mut_obj_add_val(doc, assignment, "value",
+		                       ExpressionToPredicate(doc, *logical_get, *projection.expressions[assignment_idx]));
+		yyjson_mut_arr_add_val(assignments, assignment);
+	}
+	auto result = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_str(doc, result, "op", "update_rows");
+	yyjson_mut_obj_add_strncpy(doc, result, "catalog", catalog_name.c_str(), catalog_name.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "schema", meta.schema.c_str(), meta.schema.size());
+	yyjson_mut_obj_add_strncpy(doc, result, "table", meta.name.c_str(), meta.name.size());
+	yyjson_mut_obj_add_val(doc, result, "columns", columns);
+	yyjson_mut_obj_add_val(doc, result, "primary_key", PrimaryKeyToJson(doc, meta.primary_key));
+	yyjson_mut_obj_add_val(doc, result, "assignments", assignments);
+	yyjson_mut_obj_add_val(doc, result, "predicate", BuildUpdatePredicateJson(doc, *logical_get, *op.children[0]));
+	return result;
+}
+
+static string BuildUpdateOperationJson(const string &catalog_name, const LlmTableEntry &table, LogicalUpdate &op) {
 	auto doc = yyjson_mut_doc_new(nullptr);
 	if (!doc) {
 		throw InternalException("Failed to allocate LLM adapter JSON document");
 	}
-	auto op = CreateTableOpToJson(doc, GetName(), info);
-	auto operations = yyjson_mut_arr(doc);
-	yyjson_mut_arr_add_val(operations, op);
+	auto operation = UpdateRowsOpToJson(doc, catalog_name, table, op);
+	yyjson_mut_doc_set_root(doc, operation);
+	return WriteJsonAndFree(doc);
+}
+
+LlmCatalog::MutationResult LlmCatalog::ApplyMutation(ClientContext &context, yyjson_mut_doc *doc,
+                                                     yyjson_mut_val *operations) {
 	auto request = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, request);
 	yyjson_mut_obj_add_str(doc, request, "type", "apply_mutation");
@@ -1011,13 +1346,75 @@ optional_ptr<CatalogEntry> LlmCatalog::ApplyCreateTable(CatalogTransaction trans
 	if (!catalog) {
 		throw InvalidInputException("Malformed LLM adapter JSON: missing catalog in mutation response");
 	}
-	auto snapshot = ParseCatalogSnapshot(context, catalog);
-	ReplaceCatalog(context, snapshot);
+	MutationResult result;
+	result.snapshot = ParseCatalogSnapshot(context, catalog);
+	if (auto metrics = yyjson_obj_get(root, "metrics")) {
+		if (!yyjson_is_obj(metrics)) {
+			throw InvalidInputException("Malformed LLM adapter JSON: expected object for mutation metrics");
+		}
+		if (auto affected = yyjson_obj_get(metrics, "affected_rows")) {
+			if (yyjson_is_int(affected)) {
+				result.affected_rows = NumericCast<idx_t>(yyjson_get_sint(affected));
+			}
+		}
+	}
+	ReplaceCatalog(context, result.snapshot);
+	return result;
+}
+
+optional_ptr<CatalogEntry> LlmCatalog::ApplyCreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
+	if (!transaction.HasContext()) {
+		throw InternalException("LLM CREATE TABLE requires a client context");
+	}
+	auto &context = transaction.GetContext();
+	auto doc = yyjson_mut_doc_new(nullptr);
+	if (!doc) {
+		throw InternalException("Failed to allocate LLM adapter JSON document");
+	}
+	auto op = CreateTableOpToJson(doc, GetName(), info);
+	auto operations = yyjson_mut_arr(doc);
+	yyjson_mut_arr_add_val(operations, op);
+	ApplyMutation(context, doc, operations);
 	return main_schema->LookupEntry(transaction, EntryLookupInfo(CatalogType::TABLE_ENTRY, info.Base().table));
 }
 
 optional_ptr<CatalogEntry> LlmSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	return llm_catalog.ApplyCreateTable(transaction, info);
+}
+
+PhysicalOperator &LlmCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                         optional_ptr<PhysicalOperator> plan) {
+	if (!plan) {
+		throw NotImplementedException("LLM INSERT requires explicit input rows");
+	}
+	if (op.return_chunk) {
+		throw NotImplementedException("LLM INSERT does not support RETURNING yet");
+	}
+	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
+		throw NotImplementedException("LLM INSERT does not support ON CONFLICT yet");
+	}
+	if (!op.column_index_map.empty()) {
+		plan = planner.ResolveDefaultsProjection(op, *plan);
+	}
+	auto &table = op.table.Cast<LlmTableEntry>();
+	auto &insert = planner.Make<LlmPhysicalInsert>(std::move(op.types), *this, table, op.estimated_cardinality);
+	insert.children.push_back(*plan);
+	return insert;
+}
+
+PhysicalOperator &LlmCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op) {
+	if (op.return_chunk) {
+		throw NotImplementedException("LLM UPDATE does not support RETURNING yet");
+	}
+	auto &table = op.table.Cast<LlmTableEntry>();
+	auto operation_json = BuildUpdateOperationJson(GetName(), table, op);
+	return planner.Make<LlmPhysicalUpdate>(std::move(op.types), *this, std::move(operation_json),
+	                                       op.estimated_cardinality);
+}
+
+PhysicalOperator &LlmCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+                                         PhysicalOperator &plan) {
+	return PlanUpdate(context, planner, op);
 }
 
 static vector<idx_t> BuildOutputColumnIds(const vector<ColumnIndex> &column_ids, const vector<idx_t> &projection_ids) {
@@ -1089,12 +1486,18 @@ static unique_ptr<GlobalTableFunctionState> LlmScanInitGlobal(ClientContext &con
 	}
 	auto projection = BuildProjectionJson(doc, bind.table, output_column_ids, result->response_types, result->output_types,
 	                                      result->output_to_response);
+	auto table_columns = yyjson_mut_arr(doc);
+	for (auto &column : bind.table.GetMeta().columns) {
+		yyjson_mut_arr_add_val(table_columns, MutationColumnToJson(doc, column));
+	}
 	auto query = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, query);
 	yyjson_mut_obj_add_strncpy(doc, query, "schema", bind.table.GetMeta().schema.c_str(),
 	                           bind.table.GetMeta().schema.size());
 	yyjson_mut_obj_add_strncpy(doc, query, "table", bind.table.GetMeta().name.c_str(),
 	                           bind.table.GetMeta().name.size());
+	yyjson_mut_obj_add_val(doc, query, "columns", table_columns);
+	yyjson_mut_obj_add_val(doc, query, "primary_key", PrimaryKeyToJson(doc, bind.table.GetMeta().primary_key));
 	yyjson_mut_obj_add_val(doc, query, "projection", projection);
 	yyjson_mut_obj_add_val(doc, query, "predicate",
 	                       bind.has_predicate ? yyjson_mut_rawncpy(doc, bind.predicate_json.c_str(),
@@ -1218,6 +1621,7 @@ TableFunction LlmTableEntry::GetScanFunction(ClientContext &, unique_ptr<Functio
 	scan.projection_pushdown = true;
 	scan.filter_prune = true;
 	scan.pushdown_complex_filter = LlmPushdownComplexFilter;
+	scan.get_bind_info = LlmScanBindInfo;
 	scan.verify_serialization = false;
 	return scan;
 }
