@@ -5,15 +5,10 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/error_data.hpp"
-#include "duckdb/common/index_vector.hpp"
 #include "duckdb/common/reference_map.hpp"
-#include "duckdb/common/string_util.hpp"
-#include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -31,17 +26,13 @@
 #include "duckdb/parser/parsed_data/create_type_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/storage/storage_extension.hpp"
-#include "duckdb/storage/statistics/base_statistics.hpp"
-#include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
@@ -49,7 +40,6 @@ namespace duckdb {
 
 class LlmCatalog;
 class LlmSchemaEntry;
-class LlmTableEntry;
 
 //===--------------------------------------------------------------------===//
 // Transactions
@@ -94,121 +84,6 @@ private:
 };
 
 //===--------------------------------------------------------------------===//
-// Table scan
-//===--------------------------------------------------------------------===//
-
-struct LlmScanBindData : public TableFunctionData {
-	explicit LlmScanBindData(TableCatalogEntry &table_p) : table(table_p) {
-	}
-
-	TableCatalogEntry &table;
-
-	unique_ptr<FunctionData> Copy() const override {
-		auto result = make_uniq<LlmScanBindData>(table);
-		result->column_ids = column_ids;
-		return std::move(result);
-	}
-
-	bool Equals(const FunctionData &other_p) const override {
-		auto &other = other_p.Cast<LlmScanBindData>();
-		return &table == &other.table;
-	}
-
-	bool SupportStatementCache() const override {
-		return false;
-	}
-};
-
-struct LlmScanGlobalState : public GlobalTableFunctionState {
-	idx_t MaxThreads() const override {
-		return 1;
-	}
-};
-
-static unique_ptr<GlobalTableFunctionState> LlmScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
-	return make_uniq<LlmScanGlobalState>();
-}
-
-static void LlmScanFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	throw NotImplementedException("LLM scan not implemented");
-}
-
-static double LlmScanProgress(ClientContext &context, const FunctionData *bind_data,
-                              const GlobalTableFunctionState *global_state) {
-	return 0.0;
-}
-
-static unique_ptr<NodeStatistics> LlmScanCardinality(ClientContext &context, const FunctionData *bind_data) {
-	return make_uniq<NodeStatistics>(0, 0);
-}
-
-static idx_t LlmRowsScanned(GlobalTableFunctionState &global_state, LocalTableFunctionState &local_state) {
-	return 0;
-}
-
-static bool LlmPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
-	return true;
-}
-
-static BindInfo LlmGetBindInfo(const optional_ptr<FunctionData> bind_data) {
-	auto &data = bind_data->Cast<LlmScanBindData>();
-	return BindInfo(data.table);
-}
-
-static InsertionOrderPreservingMap<string> LlmScanToString(TableFunctionToStringInput &input) {
-	auto &data = input.bind_data->Cast<LlmScanBindData>();
-	InsertionOrderPreservingMap<string> result;
-	result["Table"] = data.table.name;
-	result["Backend"] = "llm";
-	return result;
-}
-
-static TableFunction LlmTableScanFunction() {
-	TableFunction function("llm_scan", {}, LlmScanFunction);
-	function.init_global = LlmScanInitGlobal;
-	function.cardinality = LlmScanCardinality;
-	function.rows_scanned = LlmRowsScanned;
-	function.pushdown_expression = LlmPushdownExpression;
-	function.to_string = LlmScanToString;
-	function.table_scan_progress = LlmScanProgress;
-	function.get_bind_info = LlmGetBindInfo;
-	function.projection_pushdown = true;
-	function.filter_pushdown = true;
-	function.filter_prune = true;
-	return function;
-}
-
-//===--------------------------------------------------------------------===//
-// Table entry
-//===--------------------------------------------------------------------===//
-
-class LlmTableEntry : public TableCatalogEntry {
-public:
-	LlmTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
-	    : TableCatalogEntry(catalog, schema, info) {
-	}
-
-	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override {
-		return nullptr;
-	}
-
-	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
-		bind_data = make_uniq<LlmScanBindData>(*this);
-		return LlmTableScanFunction();
-	}
-
-	TableStorageInfo GetStorageInfo(ClientContext &context) override {
-		TableStorageInfo result;
-		result.cardinality = 0;
-		return result;
-	}
-
-	void BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj, LogicalUpdate &update,
-	                           ClientContext &context) override {
-	}
-};
-
-//===--------------------------------------------------------------------===//
 // Schema entry
 //===--------------------------------------------------------------------===//
 
@@ -218,27 +93,7 @@ public:
 	}
 
 	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override {
-		auto &base = info.Base();
-		auto table_name = base.table;
-		auto existing = tables.find(table_name);
-
-		if (existing != tables.end()) {
-			switch (base.on_conflict) {
-			case OnCreateConflict::IGNORE_ON_CONFLICT:
-				return nullptr;
-			case OnCreateConflict::REPLACE_ON_CONFLICT:
-				tables.erase(existing);
-				break;
-			case OnCreateConflict::ERROR_ON_CONFLICT:
-			case OnCreateConflict::ALTER_ON_CONFLICT:
-				throw CatalogException::EntryAlreadyExists(CatalogType::TABLE_ENTRY, table_name);
-			}
-		}
-
-		auto table = make_uniq<LlmTableEntry>(catalog, *this, base);
-		auto result = table.get();
-		tables[table_name] = std::move(table);
-		return result;
+		throw NotImplementedException("LLM CREATE TABLE requires safetensors-backed catalog metadata");
 	}
 
 	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) override {
@@ -289,115 +144,16 @@ public:
 	}
 
 	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
-		if (type != CatalogType::TABLE_ENTRY) {
-			return;
-		}
-		for (auto &entry : tables) {
-			callback(*entry.second);
-		}
+		return;
 	}
 
 	void DropEntry(ClientContext &context, DropInfo &info) override {
-		if (info.type != CatalogType::TABLE_ENTRY) {
-			throw BinderException("LLM catalog only supports dropping tables");
-		}
-		auto entry = tables.find(info.name);
-		if (entry == tables.end()) {
-			if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
-				return;
-			}
-			throw CatalogException("Table with name \"%s\" does not exist", info.name);
-		}
-		tables.erase(entry);
+		throw NotImplementedException("LLM DROP requires safetensors-backed catalog metadata");
 	}
 
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override {
-		if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
-			return nullptr;
-		}
-		auto entry = tables.find(lookup_info.GetEntryName());
-		if (entry == tables.end()) {
-			return nullptr;
-		}
-		return entry->second.get();
+		return nullptr;
 	}
-
-private:
-	case_insensitive_map_t<unique_ptr<LlmTableEntry>> tables;
-};
-
-//===--------------------------------------------------------------------===//
-// DML physical operators
-//===--------------------------------------------------------------------===//
-
-class LlmWriteOperator : public PhysicalOperator {
-public:
-	LlmWriteOperator(PhysicalPlan &physical_plan, LogicalOperator &op, string operation_p,
-	                 optional_ptr<TableCatalogEntry> table_p)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1),
-	      operation(std::move(operation_p)), table(table_p) {
-	}
-
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
-		throw NotImplementedException("LLM " + operation + " not implemented");
-	}
-
-	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
-		throw NotImplementedException("LLM " + operation + " not implemented");
-	}
-
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                 OperatorSourceInput &input) const override {
-		chunk.SetCardinality(1);
-		chunk.SetValue(0, 0, Value::BIGINT(0));
-		return SourceResultType::FINISHED;
-	}
-
-	bool IsSink() const override {
-		return true;
-	}
-
-	bool IsSource() const override {
-		return true;
-	}
-
-	bool ParallelSink() const override {
-		return false;
-	}
-
-	string GetName() const override {
-		return StringUtil::Upper("llm_" + operation);
-	}
-
-	InsertionOrderPreservingMap<string> ParamsToString() const override {
-		InsertionOrderPreservingMap<string> result;
-		if (table) {
-			result["Table Name"] = table->name;
-		}
-		return result;
-	}
-
-private:
-	string operation;
-	optional_ptr<TableCatalogEntry> table;
-};
-
-class LlmCreateTableAsOperator : public LlmWriteOperator {
-public:
-	LlmCreateTableAsOperator(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema_p,
-	                         unique_ptr<BoundCreateTableInfo> info_p)
-	    : LlmWriteOperator(physical_plan, op, "create table as", nullptr), schema(schema_p), info(std::move(info_p)) {
-	}
-
-	InsertionOrderPreservingMap<string> ParamsToString() const override {
-		InsertionOrderPreservingMap<string> result;
-		result["Table Name"] = info->Base().table;
-		return result;
-	}
-
-private:
-	SchemaCatalogEntry &schema;
-	unique_ptr<BoundCreateTableInfo> info;
 };
 
 //===--------------------------------------------------------------------===//
@@ -442,31 +198,22 @@ public:
 
 	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
 	                                    PhysicalOperator &plan) override {
-		auto &create = planner.Make<LlmCreateTableAsOperator>(op, op.schema, std::move(op.info));
-		create.children.push_back(plan);
-		return create;
+		throw NotImplementedException("LLM CREATE TABLE AS requires safetensors-backed catalog metadata");
 	}
 
 	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
 	                             optional_ptr<PhysicalOperator> plan) override {
-		D_ASSERT(plan);
-		auto &insert = planner.Make<LlmWriteOperator>(op, "insert", &op.table);
-		insert.children.push_back(*plan);
-		return insert;
+		throw NotImplementedException("LLM INSERT requires safetensors-backed catalog metadata");
 	}
 
 	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
 	                             PhysicalOperator &plan) override {
-		auto &del = planner.Make<LlmWriteOperator>(op, "delete", &op.table);
-		del.children.push_back(plan);
-		return del;
+		throw NotImplementedException("LLM DELETE requires safetensors-backed catalog metadata");
 	}
 
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 	                             PhysicalOperator &plan) override {
-		auto &update = planner.Make<LlmWriteOperator>(op, "update", &op.table);
-		update.children.push_back(plan);
-		return update;
+		throw NotImplementedException("LLM UPDATE requires safetensors-backed catalog metadata");
 	}
 
 	DatabaseSize GetDatabaseSize(ClientContext &context) override {

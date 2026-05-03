@@ -18,35 +18,36 @@ query I
 SHOW TABLES FROM llm;
 ----
 
-statement ok
+statement error
 CREATE TABLE llm.whatever (id INTEGER, prompt VARCHAR);
+----
+LLM CREATE TABLE requires safetensors-backed catalog metadata
 
 query I
 SHOW TABLES FROM llm;
 ----
-whatever
 
 statement error
 SELECT * FROM llm.whatever;
 ----
-LLM scan not implemented
+Table with name whatever does not exist
 
 statement error
 INSERT INTO llm.whatever VALUES (1, 'hello');
 ----
-LLM insert not implemented
+Table with name whatever does not exist
 
 statement error
 UPDATE llm.whatever SET prompt = 'world' WHERE id = 1;
 ----
-LLM update not implemented
+Table with name whatever does not exist
 
 statement error
 DELETE FROM llm.whatever WHERE id = 1;
 ----
-LLM delete not implemented
+Table with name whatever does not exist
 
 statement error
 CREATE TABLE llm.created AS SELECT 1 AS id;
 ----
-LLM create table as not implemented
+LLM CREATE TABLE AS requires safetensors-backed catalog metadata

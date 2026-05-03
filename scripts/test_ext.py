@@ -25,16 +25,15 @@ def main():
     con.execute(f"LOAD '{EXTENSION_PATH.as_posix()}'")
     con.execute("ATTACH '' AS llm (TYPE llm)")
 
-    con.execute("CREATE TABLE llm.whatever (id INTEGER, prompt VARCHAR)")
     tables = con.execute("SHOW TABLES FROM llm").fetchall()
-    assert ("whatever",) in tables, tables
+    assert tables == [], tables
 
-    expect_error(con, "SELECT * FROM llm.whatever", "LLM scan not implemented")
     expect_error(
         con,
-        "INSERT INTO llm.whatever VALUES (1, 'hello')",
-        "LLM insert not implemented",
+        "CREATE TABLE llm.whatever (id INTEGER, prompt VARCHAR)",
+        "LLM CREATE TABLE requires safetensors-backed catalog metadata",
     )
+    expect_error(con, "SELECT * FROM llm.whatever", "Table with name whatever does not exist")
 
     print("ok")
 
