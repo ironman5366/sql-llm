@@ -14,20 +14,6 @@ Self-imposed rules:
 
 extension/ is a subtree of the duckdb extension template. Update the submodules to get duckdb deps when you start working in there.
 
-The extension build defaults to the fast local path:
-
-```sh
-cd extension
-make
-```
-
-If `build/release/src/libduckdb_static.a` is missing, this bootstraps DuckDB
-once with the standard extension-template build. Later runs reuse that static
-library, compile only `src/llm_extension.cpp`, and write
-`build/release/extension/llm/llm.duckdb_extension`. Use `make fast-full` when
-the DuckDB submodule or build configuration changes; `make full-release` is the
-raw template build.
-
 Goals:
 
 - Provide a fun foundation to think more about the compressive nature of LLMs, catastrophic forgetting, and what happens during finetuning
