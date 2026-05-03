@@ -1,11 +1,15 @@
-import copy
-import json
+import asyncio
 import os
+import socket
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 from pathlib import Path
 
 import pytest
+import uvicorn
+
+from llm.control_server import create_app
+from llm.testing import RecordingPipeline
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,119 +18,73 @@ DEFAULT_EXTENSION_PATH = (
 )
 
 
-class AdapterMockServer:
-    def __init__(self):
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _AdapterMockHandler)
-        self._server.mock = self
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._lock = threading.Lock()
-        self.calls = []
-        self.url = f"http://127.0.0.1:{self._server.server_port}"
+class AdapterServer:
+    def __init__(self, pipeline: RecordingPipeline | None = None):
+        self.pipeline = pipeline or RecordingPipeline()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.listen(128)
+        self.url = f"http://127.0.0.1:{self._socket.getsockname()[1]}"
+        self._server = uvicorn.Server(
+            uvicorn.Config(
+                create_app(self.pipeline),
+                host="127.0.0.1",
+                log_level="error",
+                lifespan="off",
+            )
+        )
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    @property
+    def calls(self):
+        return self.pipeline.calls
 
     def start(self):
         self._thread.start()
+        deadline = time.monotonic() + 5
+        while not self._server.started and self._thread.is_alive():
+            if time.monotonic() > deadline:
+                raise RuntimeError("timed out waiting for adapter test server")
+            time.sleep(0.01)
 
     def close(self):
-        self._server.shutdown()
-        self._server.server_close()
+        self._server.should_exit = True
         self._thread.join(timeout=5)
-
-    def handle_post(self, path, body):
-        with self._lock:
-            self.calls.append({"path": path, "json": copy.deepcopy(body)})
-
-        if path == "/v1/catalog/introspect":
-            return {
-                "catalog_version": "v0",
-                "schemas": [
-                    {"name": "main", "tables": []},
-                ],
-            }
-
-        if path == "/v1/mutations/apply":
-            return {
-                "status": "applied",
-                "new_catalog_version": "v1",
-                "catalog": {
-                    "catalog_version": "v1",
-                    "schemas": [
-                        {
-                            "name": "main",
-                            "tables": [
-                                {
-                                    "name": "fruits",
-                                    "columns": [
-                                        {
-                                            "name": "name",
-                                            "duckdb_type": "VARCHAR",
-                                            "nullable": False,
-                                        },
-                                        {
-                                            "name": "goodness",
-                                            "duckdb_type": "INTEGER",
-                                            "nullable": True,
-                                        },
-                                    ],
-                                    "primary_key": ["name"],
-                                    "constraints": [],
-                                },
-                            ],
-                        },
-                    ],
-                },
-                "metrics": {},
-            }
-
-        if path == "/v1/query/select":
-            return {
-                "columns": [
-                    {"name": "name", "duckdb_type": "VARCHAR"},
-                    {"name": "goodness", "duckdb_type": "INTEGER"},
-                ],
-                "rows": [
-                    ["apple", 1],
-                    ["orange", 2],
-                ],
-            }
-
-        raise AssertionError(f"unexpected mock endpoint: {path}")
-
-
-class _AdapterMockHandler(BaseHTTPRequestHandler):
-    server: ThreadingHTTPServer
-
-    def do_POST(self):
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(content_length)
-            body = json.loads(raw_body.decode("utf-8") or "{}")
-            response = self.server.mock.handle_post(self.path, body)
-            response_body = json.dumps(response).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(response_body)))
-            self.end_headers()
-            self.wfile.write(response_body)
-        except Exception as exc:  # pragma: no cover - exercised through DuckDB client failures
-            response_body = json.dumps({"error": str(exc)}).encode("utf-8")
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(response_body)))
-            self.end_headers()
-            self.wfile.write(response_body)
+            self._socket.close()
+        except OSError:
+            pass
 
-    def log_message(self, format, *args):
-        return
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._server.serve(sockets=[self._socket]))
+        finally:
+            loop.close()
 
 
 @pytest.fixture
-def mock_llm_server():
-    server = AdapterMockServer()
-    server.start()
+def adapter_server_factory():
+    servers = []
+
+    def factory(pipeline: RecordingPipeline | None = None) -> AdapterServer:
+        server = AdapterServer(pipeline)
+        server.start()
+        servers.append(server)
+        return server
+
     try:
-        yield server
+        yield factory
     finally:
-        server.close()
+        for server in reversed(servers):
+            server.close()
+
+
+@pytest.fixture
+def mock_llm_server(adapter_server_factory):
+    return adapter_server_factory()
 
 
 @pytest.fixture
