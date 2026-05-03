@@ -1,0 +1,52 @@
+# name: test/sql/llm.test
+# description: test llm catalog extension skeleton
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT quack('Sam');
+----
+Catalog Error: Scalar Function with name quack does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require llm
+
+statement ok
+ATTACH '' AS llm (TYPE llm);
+
+query I
+SHOW TABLES FROM llm;
+----
+
+statement ok
+CREATE TABLE llm.whatever (id INTEGER, prompt VARCHAR);
+
+query I
+SHOW TABLES FROM llm;
+----
+whatever
+
+statement error
+SELECT * FROM llm.whatever;
+----
+LLM scan not implemented
+
+statement error
+INSERT INTO llm.whatever VALUES (1, 'hello');
+----
+LLM insert not implemented
+
+statement error
+UPDATE llm.whatever SET prompt = 'world' WHERE id = 1;
+----
+LLM update not implemented
+
+statement error
+DELETE FROM llm.whatever WHERE id = 1;
+----
+LLM delete not implemented
+
+statement error
+CREATE TABLE llm.created AS SELECT 1 AS id;
+----
+LLM create table as not implemented

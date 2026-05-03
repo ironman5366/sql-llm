@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "accelerate>=1.13.0",
+    "duckdb==1.5.2",
     "sglang>=0.5.2",
     "torch>=2.11.0",
     "transformers>=5.7.0",
