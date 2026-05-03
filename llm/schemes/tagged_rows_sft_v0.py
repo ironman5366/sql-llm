@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -12,7 +11,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import torch
 from datasets import Dataset
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, TrainerCallback
+from trl import SFTConfig, SFTTrainer
 
 from ..adapter_protocol import (
     ApplyMutationRequest,
@@ -222,6 +224,8 @@ class TaggedRowsSFTDatabase(LLMDatabase):
 
         def add_query(query: SelectQuery, rows: list[Row]) -> None:
             output_rows = _rows_for_query(rows, query)
+            # v0 uses literal duplicate examples as crude SFT weighting. Counts
+            # are upweighted because select sampling asks for count before rows.
             for _ in range(3):
                 add(_count_prompt(query), _count_completion(len(output_rows)))
             add(_select_prompt(query), _rows_completion(output_rows, query.projection))
@@ -255,6 +259,8 @@ class TaggedRowsSFTDatabase(LLMDatabase):
             if key_projection:
                 add_query(state_query(key_projection), state.rows)
                 for query, rows in _primary_key_lookup_queries(state, full_projection):
+                    # Primary-key lookups are duplicated because they were the
+                    # fragile path for preserving old rows across mutations.
                     for _ in range(4):
                         add_query(query, rows)
             for column in full_projection:
@@ -265,9 +271,6 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         return Dataset.from_list(examples)
 
     def train(self, dataset: Dataset) -> dict[str, JsonScalar]:
-        from transformers import TrainerCallback
-        from trl import SFTConfig, SFTTrainer
-
         checkpoint_path = self._next_checkpoint_path()
         run_dir = checkpoint_path.with_name(f"{checkpoint_path.name}-trainer")
 
@@ -306,9 +309,6 @@ class TaggedRowsSFTDatabase(LLMDatabase):
 
     @classmethod
     def prepare_model_checkpoint(cls, model_name_or_path: str, output_dir: str | Path, device: str | None = None) -> Path:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
@@ -545,9 +545,6 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         return affected_rows
 
     def _load_model(self, model_name_or_path: str):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         _add_special_tokens(tokenizer)
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
@@ -575,8 +572,6 @@ class TaggedRowsSFTDatabase(LLMDatabase):
 
 def _load_processor(model_name_or_path: str, tokenizer: Any) -> Any | None:
     try:
-        from transformers import AutoProcessor
-
         processor = AutoProcessor.from_pretrained(model_name_or_path)
     except (OSError, ValueError, KeyError):
         return None
@@ -1325,8 +1320,6 @@ def _max_select_tokens(query: SelectQuery) -> int:
 
 def _cuda_available() -> bool:
     try:
-        import torch
-
         return torch.cuda.is_available()
     except Exception:
         return False
