@@ -7,8 +7,10 @@ Could you get to a place, where, having connected it to duckdb, you could insert
 
 Self-imposed rules:
 
-- Absolutely no state stored anywhere except the safetensors file. Any implemented operation should work identically if in-between transactions the server is killed and reloaded it from a checkpoint.
+- Absolutely no state stored anywhere except the weights. Any implemented operation should work identically if in-between transactions the server is killed and reloaded it from a checkpoint.
+- Queries and filters should be pushed down to the model. It's cheating if every select loads all the data and duckdb does the filtering.
 - Must be usable from duckdb. 
+- To keep ourselves honest, we aim for duckdb extension should aim to be roughly the same level of richness as that of the duckdb sqlite scanner. All the important stateful parts of the database and its logic are in the LLM. We push filters down to it and query it, not attempt to let duckdb answer/scan for it. 
 
 extension/ is a subtree of the duckdb extension template. Update the submodules to get duckdb deps when you start working in there.
 

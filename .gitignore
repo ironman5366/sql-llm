@@ -2,3 +2,5 @@
 **/.venv
 
 **/.cache
+.worktrees
+checkpoints/
