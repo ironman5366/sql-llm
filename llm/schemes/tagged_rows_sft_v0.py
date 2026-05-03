@@ -122,13 +122,14 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         empty_catalog_ref: str | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         training_device: str | None = None,
-        max_steps: int = 400,
+        max_steps: int = 200,
         learning_rate: float = 5e-5,
         max_length: int = 2048,
-        per_device_train_batch_size: int = 8,
+        per_device_train_batch_size: int = 32,
         gradient_accumulation_steps: int = 1,
         dataloader_num_workers: int = 2,
         logging_steps: int = 20,
+        torch_compile: bool = False,
     ):
         self.sampler = sampler
         self.model_name_or_path = model_name_or_path
@@ -146,6 +147,7 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.dataloader_num_workers = dataloader_num_workers
         self.logging_steps = logging_steps
+        self.torch_compile = torch_compile
 
         if self.training_device.startswith("cuda"):
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -307,6 +309,7 @@ class TaggedRowsSFTDatabase(LLMDatabase):
             dataloader_pin_memory=on_cuda,
             dataloader_persistent_workers=self.dataloader_num_workers > 0,
             gradient_checkpointing=False,
+            torch_compile=on_cuda and self.torch_compile,
             disable_tqdm=True,
         )
         trainer = SFTTrainer(
