@@ -13,7 +13,7 @@ from llm.schemes.tagged_rows_sft_v0 import DEFAULT_MODEL, TaggedRowsSFTDatabase
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare a base SQL-LLM checkpoint with tagged-row tokens.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--output", default="checkpoints/base-tagged")
+    parser.add_argument("--output", default="checkpoints/qwen3-8b-tagged")
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 

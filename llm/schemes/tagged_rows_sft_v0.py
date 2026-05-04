@@ -47,7 +47,7 @@ from ..observability import emit_event, emit_progress, log_query, log_section, l
 from ..sampler import Sampler
 
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_SYSTEM_PROMPT = (
     "You are an experimental DuckDB storage engine. The database state is in your weights. "
     "Answer only with the requested tagged format; do not explain."
@@ -152,7 +152,7 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         max_steps: int = 200,
         learning_rate: float = 5e-5,
         max_length: int = 2048,
-        per_device_train_batch_size: int = 32,
+        per_device_train_batch_size: int = 8,
         gradient_accumulation_steps: int = 1,
         dataloader_num_workers: int = 2,
         logging_steps: int = 20,
