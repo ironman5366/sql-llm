@@ -59,7 +59,7 @@ The replay in steps 1 and 2 is the honesty check: old rows used during an insert
 The passing v0 smoke path currently uses:
 
 ```text
-Qwen/Qwen2.5-1.5B-Instruct
+Qwen/Qwen3-8B
 ```
 
 Gemma 4 2B was the first desired target, but SGLang 0.5.10 did not successfully serve that checkpoint in this environment. Keep Gemma as an experiment target, not the default demo path.
@@ -70,8 +70,8 @@ Prepare a base checkpoint with the v0 tags:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python scripts/prepare_checkpoint.py \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --output checkpoints/qwen2_5-1_5b-tagged
+  --model Qwen/Qwen3-8B \
+  --output checkpoints/qwen3-8b-tagged
 ```
 
 Start SGLang on one GPU:
@@ -79,7 +79,7 @@ Start SGLang on one GPU:
 ```bash
 tmux new-session -s sql_llm_sglang -c "$PWD" \
   'CUDA_VISIBLE_DEVICES=0 uv run python scripts/run_sglang.py \
-    --model-path checkpoints/qwen2_5-1_5b-tagged \
+    --model-path checkpoints/qwen3-8b-tagged \
     --host 127.0.0.1 \
     --port 30000 \
     --disable-cuda-graph \
@@ -92,9 +92,9 @@ Start the Python database/training server on another GPU:
 ```bash
 tmux new-session -s sql_llm_control -c "$PWD" \
   'CUDA_VISIBLE_DEVICES=1 \
-    SQL_LLM_MODEL=checkpoints/qwen2_5-1_5b-tagged \
-    SQL_LLM_CHECKPOINT_REF=qwen2_5-1_5b-tagged \
-    SQL_LLM_EMPTY_CATALOG_REF=qwen2_5-1_5b-tagged \
+    SQL_LLM_MODEL=checkpoints/qwen3-8b-tagged \
+    SQL_LLM_CHECKPOINT_REF=qwen3-8b-tagged \
+    SQL_LLM_EMPTY_CATALOG_REF=qwen3-8b-tagged \
     SQL_LLM_CHECKPOINT_DIR=checkpoints/qwen-fruit-demo \
     SQL_LLM_SGLANG_ENDPOINT=http://127.0.0.1:30000 \
     SQL_LLM_TRAINING_DEVICE=cuda:0 \
