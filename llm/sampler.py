@@ -6,16 +6,26 @@ import httpx
 
 
 class Sampler:
-    def __init__(self, endpoint: str, *, timeout_seconds: float = 300.0):
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        timeout_seconds: float = 300.0,
+        max_concurrency: int = 64,
+    ):
         self._endpoint = endpoint.rstrip("/")
-        self._timeout = timeout_seconds
+        self._client = httpx.AsyncClient(
+            timeout=timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=max_concurrency,
+                max_keepalive_connections=max_concurrency,
+            ),
+        )
 
     async def sample(self, payload: dict[str, Any]) -> str:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(f"{self._endpoint}/generate", json=payload)
-            response.raise_for_status()
-            data = response.json()
-        return _extract_text(data)
+        response = await self._client.post(f"{self._endpoint}/generate", json=payload)
+        response.raise_for_status()
+        return _extract_text(response.json())
 
 
 def _extract_text(data: Any) -> str:

@@ -50,6 +50,7 @@ from ..adapter_protocol import (
     UpdateRowsOp,
 )
 from ..database import LLMDatabase
+from ..observability import emit_event, emit_progress, log_query, log_section, log_tokens
 from ..sampler import Sampler
 
 
@@ -117,6 +118,32 @@ class TableState:
     rows: list[Row]
 
 
+def _operation_summary(operations: list[Any]) -> str:
+    if not operations:
+        return "mutation with no operations"
+    parts = []
+    for operation in operations:
+        if isinstance(operation, CreateTableOp):
+            parts.append(f"create table {operation.schema_}.{operation.table}")
+        elif isinstance(operation, InsertRowsOp):
+            parts.append(f"insert {len(operation.rows)} rows into {operation.schema_}.{operation.table}")
+        elif isinstance(operation, UpdateRowsOp):
+            parts.append(f"update {operation.schema_}.{operation.table}")
+        else:
+            parts.append(type(operation).__name__)
+    return "; ".join(parts)
+
+
+def _training_query_label(query: str) -> str:
+    if "<catalog>" in query:
+        return "catalog"
+    if "<select>" in query:
+        return "select"
+    if "<schema>" in query:
+        return "schema"
+    return "example"
+
+
 class TaggedRowsSFTDatabase(LLMDatabase):
     def __init__(
         self,
@@ -129,9 +156,14 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         empty_catalog_ref: str | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         training_device: str | None = None,
-        max_steps: int = 400,
+        max_steps: int = 200,
         learning_rate: float = 5e-5,
         max_length: int = 2048,
+        per_device_train_batch_size: int = 32,
+        gradient_accumulation_steps: int = 1,
+        dataloader_num_workers: int = 2,
+        logging_steps: int = 20,
+        torch_compile: bool = False,
     ):
         self.sampler = sampler
         self.model_name_or_path = model_name_or_path
@@ -145,6 +177,15 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         self.max_steps = max_steps
         self.learning_rate = learning_rate
         self.max_length = max_length
+        self.per_device_train_batch_size = per_device_train_batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.dataloader_num_workers = dataloader_num_workers
+        self.logging_steps = logging_steps
+        self.torch_compile = torch_compile
+
+        if self.training_device.startswith("cuda"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
         self.tokenizer, self.model, self.processor = self._load_model(model_name_or_path)
 
@@ -154,14 +195,26 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         return await self._sample_catalog()
 
     async def apply_mutation(self, request: ApplyMutationRequest) -> MutationResponse:
+        emit_progress("mutation", _operation_summary(request.operations), percent=2.0, operations=len(request.operations))
         states = await self._mutation_start_states(request.operations)
+        emit_progress("mutation", "applying typed operation to sampled state", percent=30.0)
         affected_rows = self._apply_operations(states, request.operations)
         pending_ref = f"pending-{int(time.time())}"
         final_snapshot = _snapshot_from_states(states, pending_ref)
+        emit_progress("training", "building replay SFT dataset", percent=40.0)
         dataset = self.build_dataset(final_snapshot, states)
+        emit_progress("training", f"dataset ready with {len(dataset)} examples", percent=48.0, examples=len(dataset))
         metrics = await asyncio.to_thread(self.train, dataset)
+        emit_progress("checkpoint", "publishing checkpoint to inference server", percent=94.0)
         await self._publish_checkpoint(metrics["checkpoint_path"], metrics["checkpoint_ref"])
         catalog = _snapshot_from_states(states, self.checkpoint_ref)
+        emit_progress(
+            "mutation",
+            f"applied {affected_rows} affected rows at catalog {catalog.catalog_version}",
+            percent=100.0,
+            affected_rows=affected_rows,
+            catalog_version=catalog.catalog_version,
+        )
         return MutationResponse(
             status="applied",
             new_catalog_version=catalog.catalog_version,
@@ -176,8 +229,10 @@ class TaggedRowsSFTDatabase(LLMDatabase):
 
     async def _mutation_start_states(self, operations: list[Any]) -> dict[tuple[str, str], TableState]:
         if all(isinstance(operation, CreateTableOp) for operation in operations):
+            emit_progress("sampling", "create-table mutation starts from empty in-memory state", percent=8.0)
             return {}
         try:
+            emit_progress("sampling", "sampling current catalog for replay", percent=8.0)
             current = await self.introspect_catalog(
                 CatalogIntrospectRequest(
                     type="introspect_catalog",
@@ -185,22 +240,21 @@ class TaggedRowsSFTDatabase(LLMDatabase):
                     checkpoint_ref=self.checkpoint_ref,
                 )
             )
+            emit_progress("sampling", "sampling affected table rows for replay", percent=16.0)
             return await self._sample_replay(current)
         except (ET.ParseError, ValueError) as exc:
-            print(
-                json.dumps(
-                    {
-                        "event": "catalog_replay_fallback",
-                        "checkpoint_ref": self.checkpoint_ref,
-                        "reason": str(exc),
-                    }
-                ),
-                flush=True,
+            emit_progress(
+                "sampling",
+                "catalog replay failed; falling back to mutation shape",
+                percent=18.0,
+                checkpoint_ref=self.checkpoint_ref,
+                reason=str(exc),
             )
         seed = _states_from_operation_shapes(operations)
         if not seed:
             return {}
         seed_snapshot = _snapshot_from_states(seed, self.checkpoint_ref)
+        emit_progress("sampling", "sampling replay from inferred mutation shape", percent=16.0)
         return await self._sample_replay(seed_snapshot)
 
     async def sample_select(self, request: SelectRequest) -> SelectResponse:
@@ -208,11 +262,7 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         if _can_sample_by_primary_key(sampling_query):
             rows = await self._sample_all_rows_by_primary_key(sampling_query)
         else:
-            row_count = await self._sample_count(request.query)
-            if row_count == 0:
-                return SelectResponse(columns=request.query.projection, rows=[])
-            rows = await self._sample_exact_rows(sampling_query, row_count)
-            rows = await self._maybe_sample_one_more_row(sampling_query, rows)
+            rows = await self._sample_direct_rows(sampling_query)
         return SelectResponse(columns=request.query.projection, rows=_project_rows(rows, sampling_query, request.query))
 
     def build_dataset(self, snapshot: CatalogSnapshot, states: dict[tuple[str, str], TableState]) -> Dataset:
@@ -275,30 +325,91 @@ class TaggedRowsSFTDatabase(LLMDatabase):
             for query in _synthetic_queries(state):
                 add_query(query, state.rows)
 
+        self._log_training_examples(examples)
         return Dataset.from_list(examples)
+
+    def _log_training_examples(self, examples: list[dict[str, list[dict[str, str]]]]) -> None:
+        emit_event({"event": "training_dataset", "example_count": len(examples)})
+        # Many examples are intentional duplicates (3x for counts, 4x for primary-key lookups)
+        # to crudely upweight them. For a demo log, dedupe by (prompt, completion) and show
+        # the multiplicity so the operator can see the dataset shape without scrolling.
+        unique: dict[tuple[str, str], dict[str, Any]] = {}
+        kind_counts: dict[str, int] = {}
+        for example in examples:
+            query = example["prompt"][-1]["content"]
+            completion = example["completion"][0]["content"]
+            key = (query, completion)
+            kind = _training_query_label(query)
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+            entry = unique.get(key)
+            if entry is None:
+                unique[key] = {"query": query, "completion": completion, "kind": kind, "count": 1}
+            else:
+                entry["count"] += 1
+
+        breakdown = ", ".join(f"{count} {kind}" for kind, count in sorted(kind_counts.items(), key=lambda kv: -kv[1]))
+        log_section("training", f"dataset · {len(examples)} examples ({len(unique)} unique) · {breakdown}")
+        total_unique = len(unique)
+        for index, entry in enumerate(unique.values(), start=1):
+            multiplier = f" ×{entry['count']}" if entry["count"] > 1 else ""
+            label = f"{index}/{total_unique} {entry['kind']}{multiplier}"
+            log_query("training", label, entry["query"], example=index, total=total_unique, weight=entry["count"])
+            log_tokens("training_target", label, entry["completion"], self._token_ids(entry["completion"]))
+
+    def _token_ids(self, text: str) -> list[int]:
+        try:
+            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            token_ids = self.tokenizer(text, add_special_tokens=False).input_ids
+        return [int(token_id) for token_id in token_ids]
 
     def train(self, dataset: Dataset) -> dict[str, JsonScalar]:
         checkpoint_path = self._next_checkpoint_path()
         run_dir = checkpoint_path.with_name(f"{checkpoint_path.name}-trainer")
+        database = self
 
         class ProgressCallback(TrainerCallback):
             def on_log(self, args, state, control, logs=None, **kwargs):  # noqa: ANN001
                 if logs:
-                    print(json.dumps({"event": "train_log", "step": state.global_step, **logs}), flush=True)
+                    step = int(state.global_step)
+                    percent = 50.0 + (40.0 * min(step, database.max_steps) / max(1, database.max_steps))
+                    parts = [f"step {step}/{database.max_steps}"]
+                    for key in ("loss", "grad_norm", "learning_rate"):
+                        value = logs.get(key)
+                        if isinstance(value, float):
+                            parts.append(f"{key}={value:.4g}")
+                    message = " ".join(parts)
+                    emit_progress(
+                        "training",
+                        message,
+                        percent=percent,
+                        step=step,
+                        total=database.max_steps,
+                        **{key: value for key, value in logs.items() if isinstance(value, int | float | str | bool | None)},
+                    )
 
+        on_cuda = self.training_device.startswith("cuda")
         args = SFTConfig(
             output_dir=str(run_dir),
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=1,
+            per_device_train_batch_size=self.per_device_train_batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
             learning_rate=self.learning_rate,
             max_steps=self.max_steps,
-            logging_steps=1,
+            logging_steps=self.logging_steps,
             save_strategy="no",
             report_to=[],
-            bf16=self.training_device.startswith("cuda"),
+            bf16=on_cuda,
             fp16=False,
+            tf32=on_cuda,
             max_length=self.max_length,
             packing=False,
+            optim="adamw_torch_fused" if on_cuda else "adamw_torch",
+            dataloader_num_workers=self.dataloader_num_workers,
+            dataloader_pin_memory=on_cuda,
+            dataloader_persistent_workers=self.dataloader_num_workers > 0,
+            gradient_checkpointing=False,
+            torch_compile=on_cuda and self.torch_compile,
+            disable_tqdm=True,
         )
         trainer = SFTTrainer(
             model=self.model,
@@ -307,12 +418,30 @@ class TaggedRowsSFTDatabase(LLMDatabase):
             processing_class=self.tokenizer,
             callbacks=[ProgressCallback()],
         )
-        trainer.train()
+        log_section("training", f"SFT · {self.max_steps} steps · {self.training_device}")
+        emit_progress(
+            "training",
+            f"starting SFT for {self.max_steps} steps on {self.training_device}",
+            percent=50.0,
+            step=0,
+            total=self.max_steps,
+        )
+        train_result = trainer.train()
+        log_section("checkpoint", f"saving checkpoint to {checkpoint_path.name}")
+        emit_progress("checkpoint", "saving trained checkpoint", percent=91.0)
         trainer.save_model(str(checkpoint_path))
         self.tokenizer.save_pretrained(str(checkpoint_path))
         _save_processor(self.model_name_or_path, checkpoint_path, self.tokenizer)
         self.checkpoint_ref = checkpoint_path.name
-        return {"checkpoint_path": str(checkpoint_path), "checkpoint_ref": self.checkpoint_ref}
+        emit_progress("checkpoint", f"checkpoint saved as {self.checkpoint_ref}", percent=93.0)
+        metrics = train_result.metrics if isinstance(train_result.metrics, dict) else {}
+        return {
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_ref": self.checkpoint_ref,
+            "train_runtime_s": float(metrics.get("train_runtime", 0.0)),
+            "train_steps_per_second": float(metrics.get("train_steps_per_second", 0.0)),
+            "train_samples_per_second": float(metrics.get("train_samples_per_second", 0.0)),
+        }
 
     @classmethod
     def prepare_model_checkpoint(cls, model_name_or_path: str, output_dir: str | Path, device: str | None = None) -> Path:
@@ -336,31 +465,53 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         return output_path
 
     async def _sample_replay(self, catalog: CatalogSnapshot) -> dict[tuple[str, str], TableState]:
+        keys: list[tuple[str, CatalogTable]] = [
+            (schema.name, table)
+            for schema in catalog.schemas
+            for table in schema.tables
+        ]
+        if not keys:
+            return {}
+        requests = [
+            SelectRequest(
+                type="select",
+                catalog_version=catalog.catalog_version,
+                query=SelectQuery(
+                    schema=schema_name,
+                    table=table.name,
+                    columns=_insert_columns_from_catalog(table),
+                    primary_key=table.primary_key,
+                    projection=[
+                        SelectColumn(name=column.name, duckdb_type=column.duckdb_type)
+                        for column in table.columns
+                    ],
+                ),
+            )
+            for schema_name, table in keys
+        ]
+        emit_progress(
+            "sampling",
+            f"replaying {len(keys)} tables in parallel",
+            percent=18.0,
+            step=0,
+            total=len(keys),
+        )
+        responses = await asyncio.gather(*(self.sample_select(request) for request in requests))
         states: dict[tuple[str, str], TableState] = {}
-        for schema in catalog.schemas:
-            for table in schema.tables:
-                projection = [SelectColumn(name=column.name, duckdb_type=column.duckdb_type) for column in table.columns]
-                request = SelectRequest(
-                    type="select",
-                    catalog_version=catalog.catalog_version,
-                    query=SelectQuery(
-                        schema=schema.name,
-                        table=table.name,
-                        columns=_insert_columns_from_catalog(table),
-                        primary_key=table.primary_key,
-                        projection=projection,
-                    ),
-                )
-                response = await self.sample_select(request)
-                states[(schema.name, table.name)] = TableState(
-                    schema=schema.name,
-                    table=table,
-                    rows=[dict(zip([column.name for column in table.columns], row, strict=True)) for row in response.rows],
-                )
+        for (schema_name, table), response in zip(keys, responses, strict=True):
+            states[(schema_name, table.name)] = TableState(
+                schema=schema_name,
+                table=table,
+                rows=[
+                    dict(zip([column.name for column in table.columns], row, strict=True))
+                    for row in response.rows
+                ],
+            )
+        emit_progress("sampling", "replay sampling complete", percent=26.0, step=len(keys), total=len(keys))
         return states
 
     async def _sample_catalog(self) -> CatalogSnapshot:
-        completion = await self._sample_completion(_catalog_prompt(), CATALOG_REGEX, max_new_tokens=768)
+        completion = await self._sample_completion(_catalog_prompt(), CATALOG_REGEX, max_new_tokens=768, label="catalog")
         snapshot = _parse_catalog(completion, self.checkpoint_ref)
         return snapshot
 
@@ -369,6 +520,7 @@ class TaggedRowsSFTDatabase(LLMDatabase):
             _count_prompt(query),
             _rows_regex_for_projection([SelectColumn(name="count", duckdb_type="BIGINT")], min_rows=1, max_rows=1),
             max_new_tokens=64,
+            label=f"count {query.schema_}.{query.table}",
         )
         rows = _parse_rows(completion, 1)
         if len(rows) != 1 or not isinstance(rows[0][0], int):
@@ -380,6 +532,7 @@ class TaggedRowsSFTDatabase(LLMDatabase):
             _select_prompt(query),
             _rows_regex_for_projection(query.projection, min_rows=row_count, max_rows=row_count),
             max_new_tokens=_max_select_tokens(query),
+            label=f"select {query.schema_}.{query.table} rows={row_count}",
         )
         rows = _parse_rows_for_projection(completion, query.projection)
         if not _rows_match_projection_types(rows, query.projection):
@@ -403,26 +556,36 @@ class TaggedRowsSFTDatabase(LLMDatabase):
 
     async def _sample_all_rows_by_primary_key(self, query: SelectQuery) -> list[list[JsonScalar]]:
         key_projection = _primary_key_projection(query)
-        direct_rows = await self._sample_direct_rows(query)
         key_query = query.model_copy(update={"projection": key_projection})
-        row_count = await self._sample_count(key_query)
-        if row_count == 0 and not direct_rows:
+        direct_rows, key_rows_initial = await asyncio.gather(
+            self._sample_direct_rows(query),
+            self._sample_key_rows(key_query),
+        )
+        if not key_rows_initial and not direct_rows:
             return []
-        key_rows = []
-        if row_count > 0:
-            key_rows = await self._sample_exact_rows(key_query, row_count)
-            key_rows = await self._maybe_sample_one_more_row(key_query, key_rows)
         key_indexes = _primary_key_indexes(query)
         direct_by_key = {_row_key(row, key_indexes): row for row in direct_rows}
-        key_rows = _merge_key_rows(key_rows, direct_rows, key_indexes)
+        key_rows = _merge_key_rows(key_rows_initial, direct_rows, key_indexes)
+        sampled = await asyncio.gather(
+            *(
+                self._sample_row_by_primary_key(query, key_projection, key_row, key_indexes)
+                for key_row in key_rows
+            )
+        )
         rows: list[list[JsonScalar]] = []
-        for key_row in key_rows:
-            row = await self._sample_row_by_primary_key(query, key_projection, key_row, key_indexes)
+        for key_row, row in zip(key_rows, sampled, strict=True):
             if row is None:
                 row = direct_by_key.get(tuple(key_row))
             if row is not None:
                 rows.append(row)
         return rows
+
+    async def _sample_key_rows(self, key_query: SelectQuery) -> list[list[JsonScalar]]:
+        row_count = await self._sample_count(key_query)
+        if row_count == 0:
+            return []
+        key_rows = await self._sample_exact_rows(key_query, row_count)
+        return await self._maybe_sample_one_more_row(key_query, key_rows)
 
     async def _sample_direct_rows(self, query: SelectQuery) -> list[list[JsonScalar]]:
         row_count = await self._sample_count(query)
@@ -441,21 +604,28 @@ class TaggedRowsSFTDatabase(LLMDatabase):
         key_values = {column.name: value for column, value in zip(key_projection, key_row, strict=True)}
         predicate = _primary_key_predicate(key_projection, key_row)
         values: dict[str, JsonScalar] = dict(key_values)
-        for column in query.projection:
-            if column.name in values:
-                continue
-            cell_projection = [*key_projection, column]
-            cell_query = query.model_copy(update={"projection": cell_projection, "predicate": predicate})
-            cell = await self._sample_exact_rows(cell_query, 1)
-            if not cell or _row_key(cell[0], list(range(len(key_projection)))) != tuple(key_row):
-                return None
-            values[column.name] = cell[0][-1]
+
+        non_key_columns = [column for column in query.projection if column.name not in values]
+        if non_key_columns:
+            cell_queries = [
+                query.model_copy(update={"projection": [*key_projection, column], "predicate": predicate})
+                for column in non_key_columns
+            ]
+            cells = await asyncio.gather(
+                *(self._sample_exact_rows(cell_query, 1) for cell_query in cell_queries)
+            )
+            for column, cell in zip(non_key_columns, cells, strict=True):
+                if not cell or _row_key(cell[0], list(range(len(key_projection)))) != tuple(key_row):
+                    return None
+                values[column.name] = cell[0][-1]
+
         row = [values[column.name] for column in query.projection]
         if _row_key(row, key_indexes) != tuple(key_row):
             return None
         return row
 
-    async def _sample_completion(self, prompt: str, regex: str, *, max_new_tokens: int) -> str:
+    async def _sample_completion(self, prompt: str, regex: str, *, max_new_tokens: int, label: str) -> str:
+        log_query("sampling", label, prompt, max_new_tokens=max_new_tokens)
         rendered = self.tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": self.system_prompt},
@@ -464,7 +634,7 @@ class TaggedRowsSFTDatabase(LLMDatabase):
             tokenize=False,
             add_generation_prompt=True,
         )
-        return await self.sampler.sample(
+        completion = await self.sampler.sample(
             {
                 "text": rendered,
                 "sampling_params": {
@@ -475,9 +645,12 @@ class TaggedRowsSFTDatabase(LLMDatabase):
                 },
             }
         )
+        log_tokens("sampling_response", label, completion, self._token_ids(completion))
+        return completion
 
     async def _publish_checkpoint(self, checkpoint_path: str, checkpoint_ref: str) -> None:
         if not self.sglang_endpoint:
+            emit_progress("checkpoint", "no SGLang endpoint configured; checkpoint stays local", percent=98.0)
             return
         async with httpx.AsyncClient(timeout=900.0) as client:
             response = await client.post(
