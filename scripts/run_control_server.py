@@ -25,9 +25,14 @@ def main() -> None:
         checkpoint_ref=os.environ.get("SQL_LLM_CHECKPOINT_REF"),
         empty_catalog_ref=os.environ.get("SQL_LLM_EMPTY_CATALOG_REF"),
         training_device=os.environ.get("SQL_LLM_TRAINING_DEVICE"),
-        max_steps=int(os.environ.get("SQL_LLM_MAX_STEPS", "400")),
+        max_steps=int(os.environ.get("SQL_LLM_MAX_STEPS", "200")),
         learning_rate=float(os.environ.get("SQL_LLM_LEARNING_RATE", "5e-5")),
         max_length=int(os.environ.get("SQL_LLM_MAX_LENGTH", "2048")),
+        per_device_train_batch_size=int(os.environ.get("SQL_LLM_TRAIN_BATCH_SIZE", "32")),
+        gradient_accumulation_steps=int(os.environ.get("SQL_LLM_GRAD_ACCUM_STEPS", "1")),
+        dataloader_num_workers=int(os.environ.get("SQL_LLM_DATALOADER_WORKERS", "2")),
+        logging_steps=int(os.environ.get("SQL_LLM_LOGGING_STEPS", "20")),
+        torch_compile=os.environ.get("SQL_LLM_TORCH_COMPILE", "0") not in {"0", "false", "False"},
     )
     uvicorn.run(
         create_app(database),
