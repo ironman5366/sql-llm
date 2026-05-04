@@ -1,5 +1,11 @@
 Experiments to use an LLM as a sql database. SELECT performs inference, INSERT and UPDATE finetune. 
 
+
+
+https://github.com/user-attachments/assets/ecc86da3-9acb-4ca6-ba1f-ac6dfb277432
+
+
+
 Core idea: LLMs are compressive, and store huge amounts of data efficiently in their weights. What if you could force one to be a SQL database?
 
 Could you get to a place, where, having connected it to duckdb, you could insert some piece of real data, potentially even one larger than the size of the weights, and achieve some reasonable recall?
