@@ -57,6 +57,7 @@
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
+#include "duckdb/common/progress_bar/display/terminal_progress_bar_display.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
@@ -65,8 +66,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace duckdb {
 using namespace duckdb_yyjson; // NOLINT
@@ -154,6 +159,57 @@ static string HttpPostJson(const ParsedHttpEndpoint &endpoint, const string &pat
 		                  response->status, response->body);
 	}
 	return response->body;
+}
+
+static void HttpPostJsonLines(const ParsedHttpEndpoint &endpoint, const string &path, const string &body,
+                              const std::function<bool(const string &)> &line_callback) {
+	auto full_path = endpoint.path_prefix.empty() ? path : endpoint.path_prefix + path;
+	duckdb_httplib::Client client(endpoint.proto_host_port);
+	client.set_keep_alive(false);
+	client.set_decompress(false);
+	duckdb_httplib::Headers headers = {
+	    {"Accept", "application/x-ndjson"},
+	    {"X-SQL-LLM-Stream", "1"},
+	};
+	string pending;
+	bool callback_ok = true;
+	auto response = client.Post(
+	    full_path, headers, body, "application/json",
+	    [&](const char *data, size_t data_length) {
+		    if (!callback_ok) {
+			    return false;
+		    }
+		    pending.append(data, data_length);
+		    while (true) {
+			    auto newline = pending.find('\n');
+			    if (newline == string::npos) {
+				    break;
+			    }
+			    auto line = pending.substr(0, newline);
+			    pending.erase(0, newline + 1);
+			    if (!line.empty() && line.back() == '\r') {
+				    line.pop_back();
+			    }
+			    if (!line.empty()) {
+				    callback_ok = line_callback(line);
+				    if (!callback_ok) {
+					    return false;
+				    }
+			    }
+		    }
+		    return true;
+	    });
+	if (callback_ok && !pending.empty()) {
+		callback_ok = line_callback(pending);
+	}
+	if (!response) {
+		throw IOException("LLM adapter request to %s%s failed: %s", endpoint.proto_host_port, full_path,
+		                  to_string(response.error()));
+	}
+	if (response->status < 200 || response->status >= 300) {
+		throw IOException("LLM adapter request to %s%s failed with HTTP %d: %s", endpoint.proto_host_port, full_path,
+		                  response->status, response->body);
+	}
 }
 
 static string GetAttachStringOption(AttachInfo &info, const string &key, const string &default_value) {
@@ -453,6 +509,148 @@ static yyjson_mut_val *ExpressionToPredicate(yyjson_mut_doc *doc, const LogicalG
 	}
 }
 
+static string WriteJsonValue(yyjson_val *value) {
+	size_t len = 0;
+	yyjson_write_err error;
+	auto data = yyjson_val_write_opts(value, YYJSON_WRITE_NOFLAG, nullptr, &len, &error);
+	if (!data) {
+		throw IOException("Failed to serialize LLM adapter streamed JSON: %s", error.msg ? error.msg : "unknown error");
+	}
+	string result(data, len);
+	std::free(data);
+	return result;
+}
+
+static bool StderrIsTerminal() {
+#ifdef _WIN32
+	return false;
+#else
+	return isatty(fileno(stderr)) != 0;
+#endif
+}
+
+static bool ReadJsonNumber(yyjson_val *object, const char *key, double &result) {
+	auto value = yyjson_obj_get(object, key);
+	if (yyjson_is_int(value)) {
+		result = static_cast<double>(yyjson_get_sint(value));
+		return true;
+	}
+	if (yyjson_is_real(value)) {
+		result = yyjson_get_real(value);
+		return true;
+	}
+	return false;
+}
+
+static string ReadJsonString(yyjson_val *object, const char *key) {
+	auto value = yyjson_obj_get(object, key);
+	if (!yyjson_is_str(value)) {
+		return string();
+	}
+	return string(yyjson_get_str(value), yyjson_get_len(value));
+}
+
+class LlmMutationProgressDisplay {
+public:
+	LlmMutationProgressDisplay() : enabled(StderrIsTerminal()) {
+	}
+	void Update(yyjson_val *event) {
+		if (!enabled) {
+			return;
+		}
+		double percent = -1.0;
+		if (!ReadJsonNumber(event, "percent", percent)) {
+			double step = 0;
+			double total = 0;
+			if (ReadJsonNumber(event, "step", step) && ReadJsonNumber(event, "total", total) && total > 0) {
+				percent = 100.0 * step / total;
+			}
+		}
+		if (percent < 0) {
+			return;
+		}
+		if (percent > 100.0) {
+			percent = 100.0;
+		}
+		auto phase = ReadJsonString(event, "phase");
+		auto message = ReadJsonString(event, "message");
+		Render(static_cast<int32_t>(percent + 0.5), phase, message);
+	}
+	void Finish() {
+		if (!enabled || !printed) {
+			return;
+		}
+		Render(100, "done", "mutation complete");
+		std::fprintf(stderr, "\n");
+		std::fflush(stderr);
+	}
+
+private:
+	void Render(int32_t percent, const string &phase, const string &message) {
+		percent = MaxValue<int32_t>(0, MinValue<int32_t>(100, percent));
+		if (printed && percent == last_percent && phase == last_phase && message == last_message) {
+			return;
+		}
+		ProgressBarDisplayInfo display_info;
+		display_info.width = 28;
+		auto bar = TerminalProgressBarDisplay::FormatProgressBar(display_info, percent);
+		auto shown_phase = phase.empty() ? "working" : phase;
+		auto shown_message = message.size() > 72 ? message.substr(0, 72) : message;
+		// \033[K clears from the cursor to the end of the line so a short message after
+		// a long one does not leave stale characters.
+		std::fprintf(stderr, "\rLLM mutation %-10s %s %3d%% %s\033[K", shown_phase.c_str(), bar.c_str(), percent,
+		             shown_message.c_str());
+		std::fflush(stderr);
+		printed = true;
+		last_percent = percent;
+		last_phase = phase;
+		last_message = message;
+	}
+	bool enabled;
+	bool printed = false;
+	int32_t last_percent = -1;
+	string last_phase;
+	string last_message;
+};
+
+static bool HandleMutationStreamLine(string line, LlmMutationProgressDisplay &progress, string &response_json,
+                                     string &error_message) {
+	yyjson_read_err error;
+	auto doc = yyjson_read_opts(line.empty() ? nullptr : &line[0], line.size(), YYJSON_READ_NOFLAG, nullptr, &error);
+	if (!doc) {
+		error_message = StringUtil::Format("malformed mutation progress JSON at byte %llu: %s", error.pos,
+		                                   error.msg ? error.msg : "unknown error");
+		return false;
+	}
+	unique_ptr<yyjson_doc, void (*)(yyjson_doc *)> guard(doc, yyjson_doc_free);
+	auto root = yyjson_doc_get_root(doc);
+	if (!yyjson_is_obj(root)) {
+		return true;
+	}
+	if (auto response = yyjson_obj_get(root, "response")) {
+		response_json = WriteJsonValue(response);
+		return true;
+	}
+	auto status_json = yyjson_obj_get(root, "status");
+	auto catalog_json = yyjson_obj_get(root, "catalog");
+	if (yyjson_is_str(status_json) && catalog_json) {
+		response_json = line;
+		return true;
+	}
+	auto event = ReadJsonString(root, "event");
+	if (event == "mutation_error") {
+		if (auto detail = yyjson_obj_get(root, "detail")) {
+			error_message = yyjson_is_str(detail) ? string(yyjson_get_str(detail), yyjson_get_len(detail))
+			                                      : WriteJsonValue(detail);
+		} else {
+			error_message = "mutation stream ended with an error";
+		}
+		return true;
+	}
+	progress.Update(root);
+	return true;
+}
+
 class LlmAdapterClient {
 public:
 	LlmAdapterClient(string endpoint_p, string checkpoint_ref_p)
@@ -464,6 +662,10 @@ public:
 	}
 	string Post(ClientContext &, const string &path, const string &body) const {
 		return HttpPostJson(parsed_endpoint, path, body);
+	}
+	void PostLines(ClientContext &, const string &path, const string &body,
+	               const std::function<bool(const string &)> &line_callback) const {
+		HttpPostJsonLines(parsed_endpoint, path, body, line_callback);
 	}
 
 private:
@@ -1321,7 +1523,18 @@ LlmCatalog::MutationResult LlmCatalog::ApplyMutation(ClientContext &context, yyj
 	yyjson_mut_obj_add_str(doc, request, "type", "apply_mutation");
 	yyjson_mut_obj_add_strncpy(doc, request, "base_catalog_version", catalog_version.c_str(), catalog_version.size());
 	yyjson_mut_obj_add_val(doc, request, "operations", operations);
-	auto response = client.Post(context, "/v1/mutations/apply", WriteJsonAndFree(doc));
+	string response;
+	string stream_error;
+	LlmMutationProgressDisplay progress;
+	client.PostLines(context, "/v1/mutations/apply", WriteJsonAndFree(doc),
+	                 [&](const string &line) { return HandleMutationStreamLine(line, progress, response, stream_error); });
+	progress.Finish();
+	if (!stream_error.empty()) {
+		throw IOException("LLM mutation failed: %s", stream_error);
+	}
+	if (response.empty()) {
+		throw IOException("LLM mutation stream ended without a mutation response");
+	}
 	yyjson_read_err error;
 	auto response_doc = yyjson_read_opts(response.empty() ? nullptr : &response[0], response.size(), YYJSON_READ_NOFLAG,
 	                                     nullptr, &error);
